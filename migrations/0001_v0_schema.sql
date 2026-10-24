@@ -35,7 +35,8 @@ CREATE TABLE LaundryPolicy (
     dirty_threshold     INTEGER,
     effective_from      TEXT NOT NULL,
     effective_until     TEXT,
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK (effective_until IS NULL OR effective_until >= effective_from)
 );
 
 CREATE TABLE LaundryBatch (
@@ -50,7 +51,8 @@ CREATE TABLE LaundryBatch (
     ),
     wash_method             TEXT DEFAULT 'laundry_service',
     notes                   TEXT,
-    created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK (expected_return_date >= sent_date)
 );
 
 -- ==========================================================================
@@ -114,7 +116,7 @@ CREATE TABLE Garment (
     current_laundry_batch_id TEXT REFERENCES LaundryBatch(id),
 
     -- Condition Assessment Link (forward reference, resolved after GarmentCondition)
-    current_condition_assessment_id TEXT,
+    current_condition_assessment_id TEXT REFERENCES GarmentCondition(id),
 
     -- Provenance
     owner_verified      INTEGER NOT NULL DEFAULT 0,
@@ -139,7 +141,18 @@ CREATE TABLE LaundryBatchItem (
         )
     ),
     wash_confirmed  INTEGER NOT NULL DEFAULT 0 CHECK (wash_confirmed IN (0, 1)),
-    PRIMARY KEY (batch_id, garment_id)
+    PRIMARY KEY (batch_id, garment_id),
+    CHECK (
+        (item_status = 'RETURNED_CLEAN' AND wash_confirmed = 1)
+        OR
+        (item_status = 'RETURNED_UNWASHED' AND wash_confirmed = 0)
+        OR
+        (item_status = 'MISSING_RESOLVED' AND wash_confirmed = 0)
+        OR
+        (item_status = 'IN_LAUNDRY' AND wash_confirmed = 0)
+        OR
+        item_status = 'RETURNED_DAMAGED'
+    )
 );
 
 -- ==========================================================================
@@ -249,7 +262,8 @@ CREATE TABLE WearSessionTemplate (
     template_name   TEXT NOT NULL,
     effective_from  TEXT NOT NULL,
     effective_until TEXT,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK (effective_until IS NULL OR effective_until >= effective_from)
 );
 
 CREATE TABLE WearSessionTemplateDay (
@@ -274,7 +288,8 @@ CREATE TABLE OccasionProfile (
     style_direction TEXT DEFAULT '[]',
     prohibited_items TEXT DEFAULT '[]',
     is_recurring    INTEGER NOT NULL DEFAULT 0,
-    notes           TEXT
+    notes           TEXT,
+    CHECK (formality_min <= formality_max)
 );
 
 CREATE TABLE WearSession (
@@ -336,7 +351,8 @@ CREATE TABLE RecommendationPlan (
     diversity_achieved  INTEGER DEFAULT 0,
     diversity_notes     TEXT,
     feasibility_summary TEXT DEFAULT '{}',
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK (horizon_end_date >= horizon_start_date)
 );
 
 CREATE TABLE PlanEvaluation (
@@ -426,7 +442,8 @@ CREATE TABLE OutfitWearLog (
     superseded_by_id            TEXT REFERENCES OutfitWearLog(id),
 
     feedback_notes              TEXT,
-    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    CHECK (ended_at_utc IS NULL OR started_at_utc IS NULL OR ended_at_utc >= started_at_utc)
 );
 
 CREATE TABLE OutfitWearLogItem (
@@ -484,7 +501,11 @@ CREATE TABLE WashEvent (
     ),
     confirmed_clean_at  TEXT NOT NULL,
     confirmed_by        TEXT NOT NULL DEFAULT 'owner',
-    notes               TEXT
+    notes               TEXT,
+    CHECK (
+        (method = 'spot_clean' AND cleaning_scope = 'PARTIAL_CLEAN')
+        OR method != 'spot_clean'
+    )
 );
 
 -- ==========================================================================
@@ -500,6 +521,12 @@ CREATE TABLE GarmentWearAuthorization (
     consumed_by_wear_event_id TEXT REFERENCES WearEvent(id),
     status              TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (
         status IN ('AVAILABLE', 'CONSUMED', 'CANCELLED')
+    ),
+    CHECK (
+        (status = 'CONSUMED' AND consumed_by_wear_event_id IS NOT NULL)
+        OR
+        (status IN ('AVAILABLE', 'CANCELLED')
+         AND consumed_by_wear_event_id IS NULL)
     )
 );
 
@@ -555,7 +582,14 @@ CREATE TABLE PreferenceEvidenceAlternative (
     ),
     exclusion_reason    TEXT,
     constraint_flags    TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY (evidence_id, candidate_id)
+    PRIMARY KEY (evidence_id, candidate_id),
+    CHECK (
+        (inclusion_type = 'PRESENTED' AND presentation_order IS NOT NULL)
+        OR
+        (inclusion_type = 'FEASIBLE_NOT_PRESENTED' AND was_feasible = 1 AND was_selected = 0)
+        OR
+        (inclusion_type = 'INFEASIBLE_REFERENCE' AND was_feasible = 0 AND was_selected = 0 AND exclusion_reason IS NOT NULL)
+    )
 );
 
 -- ==========================================================================
@@ -592,3 +626,14 @@ CREATE INDEX idx_fingerprint_sha256 ON GarmentImageFingerprint(sha256);
 CREATE INDEX idx_intake_fingerprint_sha256 ON GarmentIntakeFingerprint(sha256);
 CREATE INDEX idx_candidate_snapshot_session ON OutfitCandidateSnapshot(session_id);
 CREATE INDEX idx_auth_garment_status ON GarmentWearAuthorization(garment_id, status);
+
+-- ==========================================================================
+-- 17. Migration Ledger
+-- ==========================================================================
+
+CREATE TABLE IF NOT EXISTS SchemaMigration (
+    version     TEXT PRIMARY KEY,
+    filename    TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    applied_at  TEXT NOT NULL
+);
