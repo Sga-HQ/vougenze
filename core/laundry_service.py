@@ -28,6 +28,10 @@ class LaundryService:
         self.conn = conn
         self.state_engine = StateEngine(conn)
 
+    def _require_transaction(self) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError("Laundry mutations require an active transaction")
+
     @staticmethod
     def _utc_now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -72,24 +76,74 @@ class LaundryService:
         self,
         user_id: str,
         old_policy_id: str,
-        policy_type: str,
-        effective_from: str,
+        policy_type: Optional[str] = None,
+        effective_from: str = "",
+        new_policy_data: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
-        """Scenario 15: Updates laundry policy by closing old one and creating new one."""
+        """
+        Scenario 15: Updates laundry policy by retiring old policy (effective_until)
+        and atomically creating a new policy. Requires active transaction.
+        Enforces ownership, active status, date validity, and atomic replacement.
+        """
+        self._require_transaction()
+        now = self._utc_now()
+
+        old = self.conn.execute(
+            "SELECT * FROM LaundryPolicy WHERE id = ?;", (old_policy_id,)
+        ).fetchone()
+        if old is None:
+            raise KeyError(f"LaundryPolicy '{old_policy_id}' not found")
+        if old["user_id"] != user_id:
+            raise PermissionError("Cross-owner policy update rejected")
+        if old["effective_until"] is not None:
+            raise ValueError(f"Policy '{old_policy_id}' is already closed")
+
+        eff_from = effective_from
+        p_data = dict(new_policy_data or {})
+        if not eff_from and "effective_from" in p_data:
+            eff_from = p_data["effective_from"]
+        if not eff_from:
+            eff_from = now[:10]
+
+        if eff_from < old["effective_from"]:
+            raise ValueError("New effective_from cannot be earlier than old policy effective_from")
+
+        # 1. Close old policy
         self.conn.execute(
             "UPDATE LaundryPolicy SET effective_until = ? WHERE id = ?;",
-            (effective_from, old_policy_id),
+            (eff_from, old_policy_id),
         )
-        return self.create_policy(
-            user_id=user_id,
-            policy_type=policy_type,
-            effective_from=effective_from,
-            handover_weekday=kwargs.get("handover_weekday"),
-            return_weekday=kwargs.get("return_weekday"),
-            interval_days=kwargs.get("interval_days"),
-            dirty_threshold=kwargs.get("dirty_threshold"),
+
+        # 2. Insert new policy
+        pol_type = policy_type or p_data.get("policy_type") or old["policy_type"]
+        new_id = p_data.get("id") or f"lp_{uuid.uuid4().hex[:12]}"
+        handover = p_data.get("handover_weekday", kwargs.get("handover_weekday", old["handover_weekday"]))
+        ret_day = p_data.get("return_weekday", kwargs.get("return_weekday", old["return_weekday"]))
+        interval = p_data.get("interval_days", kwargs.get("interval_days", old["interval_days"]))
+        threshold = p_data.get("dirty_threshold", kwargs.get("dirty_threshold", old["dirty_threshold"]))
+
+        self.conn.execute(
+            """
+            INSERT INTO LaundryPolicy(
+                id, user_id, policy_type, handover_weekday, return_weekday,
+                interval_days, dirty_threshold, effective_from, effective_until, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?);
+            """,
+            (
+                new_id,
+                user_id,
+                pol_type,
+                handover,
+                ret_day,
+                interval,
+                threshold,
+                eff_from,
+                now,
+            ),
         )
+        return new_id
 
     def send_laundry_batch(
         self,
@@ -105,6 +159,7 @@ class LaundryService:
         Dispatches a laundry batch after complete preflight validation of all garments.
         Atomically records batch, batch items, unlinks/links, and transitions availability.
         """
+        self._require_transaction()
         if expected_return_date < sent_date:
             raise ValueError("expected_return_date must be >= sent_date")
 
@@ -208,6 +263,7 @@ class LaundryService:
         - MISSING_RESOLVED requires wash_confirmed=False
         - RETURNED_UNWASHED transitions condition to NEEDS_WASH without WashEvent.
         """
+        self._require_transaction()
         # Strict outcome guards
         if item_status == LaundryItemStatus.RETURNED_CLEAN and not wash_confirmed:
             raise ValueError("RETURNED_CLEAN requires wash_confirmed=True")
@@ -357,13 +413,46 @@ class LaundryService:
                 (batch_id,),
             )
 
-    def mark_batch_delayed(self, batch_id: str) -> None:
-        """Scenario 4: Marks a batch as delayed."""
+    def mark_batch_delayed(
+        self,
+        batch_id: str,
+        reason: Optional[str] = None,
+        new_expected_return_date: Optional[str] = None,
+        delay_reason: Optional[str] = None,
+    ) -> None:
+        """Scenario 4: Marks a batch as delayed. Rejects closed or terminal batches."""
+        self._require_transaction()
         cur = self.conn.execute("SELECT status FROM LaundryBatch WHERE id = ?;", (batch_id,))
         row = cur.fetchone()
         if not row:
             raise KeyError(f"LaundryBatch {batch_id} not found")
-        self.conn.execute(
-            "UPDATE LaundryBatch SET status = 'DELAYED' WHERE id = ?;",
-            (batch_id,),
-        )
+        if row["status"] == "RETURNED_CONFIRMED":
+            raise ValueError(f"Cannot mark batch {batch_id} as delayed from terminal status RETURNED_CONFIRMED")
+        if row["status"] not in ("IN_LAUNDRY", "PARTIAL_RETURN"):
+            raise ValueError(f"Cannot mark batch {batch_id} delayed from status '{row['status']}'")
+
+        effective_reason = delay_reason or reason
+        note_suffix = f"Delayed: {effective_reason}" if effective_reason else "Delayed"
+        if new_expected_return_date:
+            res = self.conn.execute(
+                """
+                UPDATE LaundryBatch
+                SET status = 'DELAYED',
+                    expected_return_date = ?,
+                    notes = CASE WHEN notes IS NULL THEN ? ELSE notes || '; ' || ? END
+                WHERE id = ? AND status IN ('IN_LAUNDRY', 'PARTIAL_RETURN');
+                """,
+                (new_expected_return_date, note_suffix, note_suffix, batch_id),
+            )
+        else:
+            res = self.conn.execute(
+                """
+                UPDATE LaundryBatch
+                SET status = 'DELAYED',
+                    notes = CASE WHEN notes IS NULL THEN ? ELSE notes || '; ' || ? END
+                WHERE id = ? AND status IN ('IN_LAUNDRY', 'PARTIAL_RETURN');
+                """,
+                (note_suffix, note_suffix, batch_id),
+            )
+        if res.rowcount != 1:
+            raise ValueError(f"Batch {batch_id} is not in delayable status")

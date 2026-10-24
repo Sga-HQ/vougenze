@@ -19,6 +19,36 @@ from core.models import (
 )
 
 
+class SnapshotConflictError(ValueError):
+    """Raised when an existing candidate snapshot has conflicting content."""
+    pass
+
+
+def validate_alternative_inclusion(
+    inclusion_type: str,
+    was_feasible: bool,
+    was_selected: bool,
+    presentation_order: Optional[int],
+    exclusion_reason: Optional[str],
+) -> None:
+    """Validates structural consistency for evidence alternatives."""
+    if inclusion_type == InclusionType.PRESENTED.value:
+        if presentation_order is None:
+            raise ValueError("PRESENTED alternative requires presentation_order")
+    elif inclusion_type == InclusionType.FEASIBLE_NOT_PRESENTED.value:
+        if not was_feasible:
+            raise ValueError("FEASIBLE_NOT_PRESENTED requires was_feasible=True")
+        if was_selected:
+            raise ValueError("FEASIBLE_NOT_PRESENTED requires was_selected=False")
+    elif inclusion_type == InclusionType.INFEASIBLE_REFERENCE.value:
+        if was_feasible:
+            raise ValueError("INFEASIBLE_REFERENCE requires was_feasible=False")
+        if was_selected:
+            raise ValueError("INFEASIBLE_REFERENCE requires was_selected=False")
+        if not exclusion_reason:
+            raise ValueError("INFEASIBLE_REFERENCE requires exclusion_reason")
+
+
 class PreferenceEvidenceService:
     """Manages candidate snapshots and normalized preference evidence capture."""
 
@@ -64,9 +94,19 @@ class PreferenceEvidenceService:
         ).fetchone()
 
         if existing:
-            # Verify consistency: user and session must match
+            # Mechanically verify content equality
             if existing["user_id"] != user_id or existing["session_id"] != session_id:
-                raise ValueError(f"Snapshot ID collision for candidate '{cand_id}' with mismatched identity")
+                raise SnapshotConflictError(f"Snapshot ID collision for candidate '{cand_id}' with mismatched identity")
+
+            items = self.conn.execute(
+                "SELECT outfit_role, garment_id FROM OutfitCandidateSnapshotItem WHERE candidate_id = ? ORDER BY outfit_role;",
+                (cand_id,)
+            ).fetchall()
+            existing_roles = {r["outfit_role"]: r["garment_id"] for r in items}
+            if existing_roles != candidate.roles:
+                raise SnapshotConflictError(
+                    f"Snapshot ID collision for candidate '{cand_id}' with mismatched roles: {existing_roles} vs {candidate.roles}"
+                )
             return cand_id
 
         # Insert snapshot header
@@ -125,12 +165,9 @@ class PreferenceEvidenceService:
         """
         Scenario 31, 32, 33: Records outfit selection evidence with normalized alternatives.
         Guarantees:
-        - Atomic choice set creation
+        - Atomic choice set creation via SAVEPOINT
         - Selected candidate is not duplicated in alternatives
-        - Inclusion semantics are validated:
-            PRESENTED requires presentation_order
-            FEASIBLE_NOT_PRESENTED requires was_feasible = 1, was_selected = 0
-            INFEASIBLE_REFERENCE requires was_feasible = 0, was_selected = 0, exclusion_reason required
+        - Inclusion semantics are validated
         """
         now = recorded_at or self._utc_now()
         evidence_id = f"pe_{uuid.uuid4().hex[:12]}"
@@ -147,7 +184,7 @@ class PreferenceEvidenceService:
             # Choice-set duplicate guard
             seen_candidates = {selected_cand_id}
 
-            flags = constraint_flags or {}
+            flags = dict(constraint_flags or {})
             if is_constraint_driven:
                 flags["constraint_driven"] = 1
 
@@ -172,6 +209,13 @@ class PreferenceEvidenceService:
             )
 
             # Record selected alternative
+            validate_alternative_inclusion(
+                inclusion_type=InclusionType.PRESENTED.value,
+                was_feasible=True,
+                was_selected=True,
+                presentation_order=0,
+                exclusion_reason=None,
+            )
             self.conn.execute(
                 """
                 INSERT INTO PreferenceEvidenceAlternative(
@@ -202,19 +246,16 @@ class PreferenceEvidenceService:
                     InclusionType.PRESENTED.value if was_feasible else InclusionType.INFEASIBLE_REFERENCE.value,
                 )
                 exclusion_reason: Optional[str] = alt.get("exclusion_reason")
-                alt_flags: Dict[str, Any] = alt.get("constraint_flags", {})
+                alt_flags: Dict[str, Any] = dict(alt.get("constraint_flags", {}))
 
-                # Validate inclusion semantics combinations
-                if inc_type == InclusionType.PRESENTED.value and order is None:
-                    raise ValueError("PRESENTED alternative requires presentation_order")
-                if inc_type == InclusionType.FEASIBLE_NOT_PRESENTED.value:
-                    if not was_feasible:
-                        raise ValueError("FEASIBLE_NOT_PRESENTED requires was_feasible=True")
-                if inc_type == InclusionType.INFEASIBLE_REFERENCE.value:
-                    if was_feasible:
-                        raise ValueError("INFEASIBLE_REFERENCE requires was_feasible=False")
-                    if not exclusion_reason:
-                        raise ValueError("INFEASIBLE_REFERENCE requires exclusion_reason")
+                # Shared inclusion validation
+                validate_alternative_inclusion(
+                    inclusion_type=inc_type,
+                    was_feasible=was_feasible,
+                    was_selected=False,
+                    presentation_order=order,
+                    exclusion_reason=exclusion_reason,
+                )
 
                 self.conn.execute(
                     """
@@ -249,14 +290,16 @@ class PreferenceEvidenceService:
         occasion_context: str,
         rejected_candidate: OutfitCandidate,
         rejection_reason: Union[RejectionReason, str],
+        rejection_note: Optional[str] = None,
         alternatives: Optional[List[Dict[str, Any]]] = None,
         recorded_at: Optional[str] = None,
+        constraint_flags: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Scenario 34 & 35: Records chronological rejection evidence.
         - Uses enumerated reason code.
         - If rejection_reason is ITEM_IN_LAUNDRY, sets laundry_constrained flag to yield NO taste penalty.
-        - Preserves chronological sequence for taste shift detection.
+        - Validates inclusion semantics for all alternatives with shared validator.
         """
         now = recorded_at or self._utc_now()
         evidence_id = f"pe_{uuid.uuid4().hex[:12]}"
@@ -264,7 +307,15 @@ class PreferenceEvidenceService:
 
         self.conn.execute(f"SAVEPOINT {sp_id};")
         try:
-            reason_val = rejection_reason.value if isinstance(rejection_reason, RejectionReason) else str(rejection_reason)
+            if isinstance(rejection_reason, str):
+                try:
+                    reason_enum = RejectionReason(rejection_reason)
+                except ValueError:
+                    reason_enum = RejectionReason.OTHER
+            else:
+                reason_enum = rejection_reason
+
+            reason_val = reason_enum.value
 
             rej_cand_id = self.create_candidate_snapshot(
                 user_id=user_id,
@@ -274,8 +325,10 @@ class PreferenceEvidenceService:
 
             seen_candidates = {rej_cand_id}
 
-            flags: Dict[str, Any] = {}
-            if reason_val == RejectionReason.ITEM_IN_LAUNDRY.value or "laundry" in reason_val.lower():
+            flags = dict(constraint_flags or {})
+            if rejection_note:
+                flags["rejection_note"] = rejection_note
+            if reason_enum == RejectionReason.ITEM_IN_LAUNDRY:
                 flags["laundry_constrained"] = 1
                 flags["aesthetic_penalty"] = 0
 
@@ -299,6 +352,13 @@ class PreferenceEvidenceService:
                 ),
             )
 
+            validate_alternative_inclusion(
+                inclusion_type=InclusionType.PRESENTED.value,
+                was_feasible=True,
+                was_selected=False,
+                presentation_order=0,
+                exclusion_reason=reason_val,
+            )
             self.conn.execute(
                 """
                 INSERT INTO PreferenceEvidenceAlternative(
@@ -311,7 +371,7 @@ class PreferenceEvidenceService:
             )
 
             if alternatives:
-                for order, alt in enumerate(alternatives, start=1):
+                for default_order, alt in enumerate(alternatives, start=1):
                     cand: OutfitCandidate = alt["candidate"]
                     alt_cand_id = self.create_candidate_snapshot(
                         user_id=user_id,
@@ -323,8 +383,19 @@ class PreferenceEvidenceService:
                     seen_candidates.add(alt_cand_id)
 
                     was_feasible = alt.get("was_feasible", True)
-                    inc_type = alt.get("inclusion_type", "PRESENTED")
-                    alt_flags = alt.get("constraint_flags", {})
+                    inc_type = alt.get("inclusion_type", InclusionType.PRESENTED.value if was_feasible else InclusionType.INFEASIBLE_REFERENCE.value)
+                    exclusion_reason = alt.get("exclusion_reason")
+                    alt_flags = dict(alt.get("constraint_flags", {}))
+                    order = alt.get("presentation_order") if "presentation_order" in alt else default_order
+
+                    # Strict shared inclusion validation
+                    validate_alternative_inclusion(
+                        inclusion_type=inc_type,
+                        was_feasible=was_feasible,
+                        was_selected=False,
+                        presentation_order=order,
+                        exclusion_reason=exclusion_reason,
+                    )
 
                     self.conn.execute(
                         """
@@ -340,7 +411,7 @@ class PreferenceEvidenceService:
                             order,
                             1 if was_feasible else 0,
                             inc_type,
-                            alt.get("exclusion_reason"),
+                            exclusion_reason,
                             json.dumps(alt_flags),
                         ),
                     )

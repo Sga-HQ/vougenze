@@ -49,7 +49,7 @@ class SchemaInvariantHarness:
             tables = conn.execute(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'SchemaMigration';"
             ).fetchone()[0]
-            self.assert_pass("34 expected domain tables exist", tables == 34)
+            self.assert_pass("36 expected domain tables exist", tables == 36)
 
             # 2. Foreign keys on Garment
             fks = conn.execute("PRAGMA foreign_key_list('Garment');").fetchall()

@@ -1,20 +1,24 @@
 """
-Vougenze Session & Routine Materialization Service (Frozen Spec 2.7, Scenarios 13-14).
-Handles routine templates, day schedules, horizon session materialization per local civil date,
-and automatic plan invalidation upon session creation/materialization.
+Vougenze Session Template & Horizon Materialization Service (Frozen Spec 2.6, 2.7, Scenarios 1–3).
+Manages WearSessionTemplate, materialization of civil dates into concrete WearSession rows,
+and invalidation of overlapping proposed plans. Requires active transactions for mutations.
 """
 from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, date, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Set
 
-from core.models import InvalidationReason, PlanStatus
+from core.models import (
+    SessionImportance,
+    PlanStatus,
+    InvalidationReason,
+)
 
 
 class SessionService:
-    """Service managing wear session templates and horizon session materialization."""
+    """Service managing wear session templates, horizon materialization, and ad-hoc sessions."""
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -23,13 +27,18 @@ class SessionService:
     def _utc_now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    def _require_transaction(self) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError("Session mutations require an active transaction")
+
     def create_template(
         self,
         user_id: str,
         template_name: str,
-        effective_from: str,
-        effective_until: Optional[str] = None,
+        effective_from: str,  # YYYY-MM-DD
+        effective_until: Optional[str] = None,  # YYYY-MM-DD
     ) -> str:
+        """Scenario 1: Creates a new weekly WearSessionTemplate."""
         template_id = f"wst_{uuid.uuid4().hex[:12]}"
         now = self._utc_now()
         self.conn.execute(
@@ -52,6 +61,7 @@ class SessionService:
         expected_duration_hours: Optional[float] = None,
         sort_order: int = 0,
     ) -> str:
+        """Defines a recurring session slot on a given weekday for the template."""
         day_id = f"wstd_{uuid.uuid4().hex[:12]}"
         roles_json = json.dumps(required_roles or ["top", "bottom", "footwear"])
         self.conn.execute(
@@ -89,6 +99,7 @@ class SessionService:
         generated_from_template_id: Optional[str] = None,
     ) -> str:
         """Creates a concrete WearSession instance and invalidates overlapping proposed plans."""
+        self._require_transaction()
         session_id = f"ws_{uuid.uuid4().hex[:12]}"
         now = self._utc_now()
         roles_json = json.dumps(required_roles or ["top", "bottom", "footwear"])
@@ -132,29 +143,39 @@ class SessionService:
         """
         Materializes template days into concrete WearSession rows for the given civil date range.
         Evaluates active template validity per date so templates active for partial horizons work correctly.
-        Invalidates overlapping proposed plans when new sessions are materialized.
+        Invalidates overlapping proposed plans only for actual created session dates.
         """
+        self._require_transaction()
+        supplied_template = None
         if template_id:
             t_row = self.conn.execute(
-                "SELECT user_id FROM WearSessionTemplate WHERE id = ?;", (template_id,)
+                "SELECT * FROM WearSessionTemplate WHERE id = ?;", (template_id,)
             ).fetchone()
             if not t_row:
                 raise KeyError(f"WearSessionTemplate {template_id} not found")
             if t_row["user_id"] != user_id:
                 raise PermissionError("Template belongs to a different user")
+            supplied_template = t_row
 
         start_dt = date.fromisoformat(start_date)
         end_dt = date.fromisoformat(end_date)
         current = start_dt
 
         created_session_ids = []
+        created_dates: Set[str] = set()
+
         while current <= end_dt:
             curr_str = current.isoformat()
             dow = current.weekday()  # Monday is 0, Sunday is 6
 
             # Resolve active template for this specific civil date
-            if template_id:
-                active_t_id = template_id
+            if supplied_template:
+                t_from = supplied_template["effective_from"]
+                t_until = supplied_template["effective_until"]
+                if t_from <= curr_str and (t_until is None or t_until >= curr_str):
+                    active_t_id = supplied_template["id"]
+                else:
+                    active_t_id = None
             else:
                 cur = self.conn.execute(
                     """
@@ -169,7 +190,6 @@ class SessionService:
                 active_t_id = row["id"] if row else None
 
             if active_t_id:
-                # Fetch template days for this dow
                 days_cur = self.conn.execute(
                     """
                     SELECT * FROM WearSessionTemplateDay
@@ -213,11 +233,14 @@ class SessionService:
                             ),
                         )
                         created_session_ids.append(sid)
+                        created_dates.add(curr_str)
 
             current += timedelta(days=1)
 
-        # Invalidate overlapping plans if any new session was materialized
-        if created_session_ids:
+        # Invalidate overlapping plans only if and where sessions were newly created
+        if created_dates:
+            min_date = min(created_dates)
+            max_date = max(created_dates)
             self.conn.execute(
                 """
                 UPDATE RecommendationPlan
@@ -226,7 +249,7 @@ class SessionService:
                 WHERE user_id = ? AND status = 'PROPOSED'
                   AND horizon_start_date <= ? AND horizon_end_date >= ?;
                 """,
-                (InvalidationReason.EVENT_ADDED_OR_MODIFIED.value, user_id, end_date, start_date),
+                (InvalidationReason.EVENT_ADDED_OR_MODIFIED.value, user_id, max_date, min_date),
             )
 
         return created_session_ids

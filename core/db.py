@@ -129,14 +129,19 @@ class Database:
             )
             for sql_file in migration_files:
                 version = sql_file.stem
-                row = conn.execute(
-                    "SELECT 1 FROM SchemaMigration WHERE version = ?;", (version,)
-                ).fetchone()
-                if row:
-                    continue
-
                 sql_content = sql_file.read_text(encoding="utf-8")
                 file_sha = hashlib.sha256(sql_content.encode("utf-8")).hexdigest()
+
+                row = conn.execute(
+                    "SELECT sha256 FROM SchemaMigration WHERE version = ?;", (version,)
+                ).fetchone()
+                if row:
+                    if row["sha256"] != file_sha:
+                        raise RuntimeError(
+                            f"Applied migration {version} differs from current file"
+                        )
+                    continue
+
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 statements = split_sql_statements(sql_content)

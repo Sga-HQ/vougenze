@@ -49,6 +49,12 @@ class PlanStatus(str, Enum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class SessionImportance(str, Enum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+
+
 class AssignmentStatus(str, Enum):
     PROPOSED = "PROPOSED"
     RESERVED = "RESERVED"

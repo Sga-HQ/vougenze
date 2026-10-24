@@ -5,7 +5,7 @@ Validates Scenarios 31, 32, 33, 34, and 35 (Data Readiness Contract).
 import json
 import unittest
 from core.db import Database
-from core.models import OutfitCandidate, InclusionType
+from core.models import OutfitCandidate, InclusionType, RejectionReason
 from core.evidence_service import PreferenceEvidenceService
 
 
@@ -168,18 +168,19 @@ class TestPreferenceEvidenceService(unittest.TestCase):
             )
 
             rejections = [
-                ("2026-03-01T10:00:00Z", "Too formal for today"),
-                ("2026-03-02T10:00:00Z", "Feeling tired of white shirts"),
-                ("2026-03-03T10:00:00Z", "Color feels too plain"),
+                ("2026-03-01T10:00:00Z", RejectionReason.OCCASION_MISMATCH, "Too formal for today"),
+                ("2026-03-02T10:00:00Z", RejectionReason.AESTHETIC, "Feeling tired of white shirts"),
+                ("2026-03-03T10:00:00Z", RejectionReason.AESTHETIC, "Color feels too plain"),
             ]
 
-            for ts, reason in rejections:
+            for ts, reason, note in rejections:
                 service.record_rejection_evidence(
                     user_id=self.user_id,
                     session_id="ws_univ",
                     occasion_context="university",
                     rejected_candidate=cand,
                     rejection_reason=reason,
+                    rejection_note=note,
                     recorded_at=ts,
                 )
 
@@ -187,9 +188,9 @@ class TestPreferenceEvidenceService(unittest.TestCase):
                 "SELECT * FROM PreferenceEvidence WHERE evidence_type = 'rejection' ORDER BY recorded_at ASC;"
             ).fetchall()
             self.assertEqual(len(evs), 3)
-            self.assertEqual(evs[0]["rejection_reason"], "Too formal for today")
-            self.assertEqual(evs[1]["rejection_reason"], "Feeling tired of white shirts")
-            self.assertEqual(evs[2]["rejection_reason"], "Color feels too plain")
+            self.assertEqual(evs[0]["rejection_reason"], RejectionReason.OCCASION_MISMATCH.value)
+            self.assertEqual(evs[1]["rejection_reason"], RejectionReason.AESTHETIC.value)
+            self.assertEqual(evs[2]["rejection_reason"], RejectionReason.AESTHETIC.value)
 
     def test_scenario_35_laundry_rejection_yields_no_taste_penalty(self):
         """Scenario 35: Rejecting outfit because items are in laundry flags laundry_constrained and 0 aesthetic penalty."""
@@ -207,7 +208,8 @@ class TestPreferenceEvidenceService(unittest.TestCase):
                 session_id="ws_univ",
                 occasion_context="university",
                 rejected_candidate=cand,
-                rejection_reason="Items are in laundry batch lb1",
+                rejection_reason=RejectionReason.ITEM_IN_LAUNDRY,
+                rejection_note="Items are in laundry batch lb1",
             )
 
             ev = conn.execute("SELECT * FROM PreferenceEvidence WHERE id = ?;", (ev_id,)).fetchone()

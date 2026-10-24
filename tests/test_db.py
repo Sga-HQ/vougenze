@@ -20,11 +20,11 @@ class TestDatabase(unittest.TestCase):
             fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
             self.assertEqual(fk, 1, "PRAGMA foreign_keys must be ON")
 
-            # Verify table count (34 domain tables + 1 SchemaMigration ledger = 35)
+            # Verify table count (36 domain tables + 1 SchemaMigration ledger = 37)
             domain_tables = conn.execute(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'SchemaMigration';"
             ).fetchone()[0]
-            self.assertEqual(domain_tables, 34, f"Expected 34 domain tables, got {domain_tables}")
+            self.assertEqual(domain_tables, 36, f"Expected 36 domain tables, got {domain_tables}")
 
             # Verify Garment foreign keys include LaundryBatch and GarmentCondition
             fks = conn.execute("PRAGMA foreign_key_list('Garment');").fetchall()

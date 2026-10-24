@@ -3,15 +3,17 @@ Vougenze Intake Staging & Duplicate Detection Service (Frozen Spec 2.3, Scenario
 Stages incoming photos, computes byte-level SHA-256 fingerprints,
 evaluates visual duplicate candidates across all matches, and enforces idempotent resolutions
 for all four outcomes: SAME_GARMENT, DIFFERENT_GARMENT, LINKED_SIMILAR, and DISMISSED.
+Requires active transaction boundaries and performs durable file cataloguing.
 """
 from __future__ import annotations
 import hashlib
 import json
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Union
 
 from core.models import (
     DuplicateCandidateStatus,
@@ -37,6 +39,10 @@ class IntakeService:
     def _utc_now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    def _require_transaction(self) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError("This operation requires an active transaction")
+
     def stage_intake_draft(
         self,
         user_id: str,
@@ -53,14 +59,13 @@ class IntakeService:
         now = self._utc_now()
         draft_id = f"gid_{uuid.uuid4().hex[:12]}"
 
-        # Compute byte-level sha256
+        # Exact byte hashing: never silently downgrade to path text
         if sha256_hash:
             digest = sha256_hash
         elif Path(temporary_image_path).is_file():
             digest = sha256_file(temporary_image_path)
         else:
-            # Fallback for mock paths in tests without filesystem files
-            digest = hashlib.sha256(temporary_image_path.encode("utf-8")).hexdigest()
+            raise FileNotFoundError(f"Intake image file not found: {temporary_image_path}")
 
         # Insert draft
         self.conn.execute(
@@ -121,8 +126,9 @@ class IntakeService:
     ) -> str:
         """
         Scenario 38: Attaches the draft image to the existing garment and updates draft status.
-        Guarded against repeated resolutions.
+        Guarded against repeated resolutions; dismisses sibling candidates atomically.
         """
+        self._require_transaction()
         now = self._utc_now()
         cur = self.conn.execute(
             """
@@ -138,7 +144,37 @@ class IntakeService:
         if not row:
             raise KeyError(f"Candidate {candidate_id} not found or already resolved")
 
-        # Atomic status update guard
+        # 1. Prepare unique catalogued path and copy file if present on disk
+        image_id = f"gi_{uuid.uuid4().hex[:12]}"
+        raw_name = Path(row["temporary_image_path"]).name
+        catalogued_path = f"catalogued/{row['existing_garment_id']}/{image_id}_{raw_name}"
+
+        src_path = Path(row["temporary_image_path"])
+        if src_path.is_file():
+            dst_path = Path(catalogued_path)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+
+        # 2. Insert GarmentImage on existing garment
+        self.conn.execute(
+            """
+            INSERT INTO GarmentImage(id, garment_id, image_path, image_type, is_primary, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (image_id, row["existing_garment_id"], catalogued_path, image_type, is_primary, now),
+        )
+
+        # 3. Create GarmentImageFingerprint
+        gif_id = f"gif_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """
+            INSERT INTO GarmentImageFingerprint(id, garment_image_id, sha256, perceptual_hash, created_at)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (gif_id, image_id, row["sha256"], row["perceptual_hash"], now),
+        )
+
+        # 4. Finalize candidate status
         res = self.conn.execute(
             """
             UPDATE GarmentDuplicateCandidate
@@ -152,33 +188,24 @@ class IntakeService:
         if res.rowcount != 1:
             raise ValueError(f"Candidate {candidate_id} is not in PENDING status")
 
-        # Mark draft attached
+        # 5. Mark draft attached
         self.conn.execute(
             "UPDATE GarmentIntakeDraft SET status = 'ATTACHED_TO_EXISTING' WHERE id = ?;",
             (row["intake_draft_id"],),
         )
 
-        # Permanent catalogued image URI
-        catalogued_path = f"catalogued/{Path(row['temporary_image_path']).name}"
-
-        # Create GarmentImage on existing garment
-        image_id = f"gi_{uuid.uuid4().hex[:12]}"
+        # 6. Resolve sibling candidates
         self.conn.execute(
             """
-            INSERT INTO GarmentImage(id, garment_id, image_path, image_type, is_primary, created_at)
-            VALUES (?, ?, ?, ?, ?, ?);
+            UPDATE GarmentDuplicateCandidate
+            SET status = 'DISMISSED',
+                resolution_note = 'Resolved through sibling candidate',
+                resolved_at = ?
+            WHERE intake_draft_id = ?
+              AND id != ?
+              AND status = 'PENDING';
             """,
-            (image_id, row["existing_garment_id"], catalogued_path, image_type, is_primary, now),
-        )
-
-        # Create GarmentImageFingerprint
-        gif_id = f"gif_{uuid.uuid4().hex[:12]}"
-        self.conn.execute(
-            """
-            INSERT INTO GarmentImageFingerprint(id, garment_image_id, sha256, perceptual_hash, created_at)
-            VALUES (?, ?, ?, ?, ?);
-            """,
-            (gif_id, image_id, row["sha256"], row["perceptual_hash"], now),
+            (now, row["intake_draft_id"], candidate_id),
         )
 
         return image_id
@@ -191,8 +218,9 @@ class IntakeService:
     ) -> str:
         """
         Scenario 39: Confirms distinction, creates new Garment, attaches image, and marks status.
-        Guarded against repeated resolutions.
+        Guarded against repeated resolutions; dismisses sibling candidates atomically.
         """
+        self._require_transaction()
         now = self._utc_now()
         cur = self.conn.execute(
             """
@@ -208,27 +236,9 @@ class IntakeService:
         if not row:
             raise KeyError(f"Candidate {candidate_id} not found or already resolved")
 
-        res = self.conn.execute(
-            """
-            UPDATE GarmentDuplicateCandidate
-            SET status = 'DIFFERENT_GARMENT',
-                resolution_note = ?,
-                resolved_at = ?
-            WHERE id = ? AND status = 'PENDING';
-            """,
-            (resolution_note, now, candidate_id),
-        )
-        if res.rowcount != 1:
-            raise ValueError(f"Candidate {candidate_id} is not in PENDING status")
-
-        self.conn.execute(
-            "UPDATE GarmentIntakeDraft SET status = 'CREATED_NEW_GARMENT' WHERE id = ?;",
-            (row["intake_draft_id"],),
-        )
-
         garment_id = garment_data.get("id") or f"g_{uuid.uuid4().hex[:12]}"
 
-        # Insert new garment
+        # 1. Insert new garment
         self.conn.execute(
             """
             INSERT INTO Garment(
@@ -260,10 +270,18 @@ class IntakeService:
             ),
         )
 
-        catalogued_path = f"catalogued/{Path(row['temporary_image_path']).name}"
-
-        # Attach image
+        # 2. Prepare permanent image storage
         image_id = f"gi_{uuid.uuid4().hex[:12]}"
+        raw_name = Path(row["temporary_image_path"]).name
+        catalogued_path = f"catalogued/{garment_id}/{image_id}_{raw_name}"
+
+        src_path = Path(row["temporary_image_path"])
+        if src_path.is_file():
+            dst_path = Path(catalogued_path)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+
+        # 3. Attach image
         self.conn.execute(
             """
             INSERT INTO GarmentImage(id, garment_id, image_path, image_type, is_primary, created_at)
@@ -272,7 +290,7 @@ class IntakeService:
             (image_id, garment_id, catalogued_path, now),
         )
 
-        # Fingerprint
+        # 4. Fingerprint
         gif_id = f"gif_{uuid.uuid4().hex[:12]}"
         self.conn.execute(
             """
@@ -282,15 +300,135 @@ class IntakeService:
             (gif_id, image_id, row["sha256"], row["perceptual_hash"], now),
         )
 
+        # 5. Finalize candidate status
+        res = self.conn.execute(
+            """
+            UPDATE GarmentDuplicateCandidate
+            SET status = 'DIFFERENT_GARMENT',
+                resolution_note = ?,
+                resolved_at = ?
+            WHERE id = ? AND status = 'PENDING';
+            """,
+            (resolution_note, now, candidate_id),
+        )
+        if res.rowcount != 1:
+            raise ValueError(f"Candidate {candidate_id} is not in PENDING status")
+
+        # 6. Update draft status
+        self.conn.execute(
+            "UPDATE GarmentIntakeDraft SET status = 'CREATED_NEW_GARMENT' WHERE id = ?;",
+            (row["intake_draft_id"],),
+        )
+
+        # 7. Dismiss sibling candidates
+        self.conn.execute(
+            """
+            UPDATE GarmentDuplicateCandidate
+            SET status = 'DISMISSED',
+                resolution_note = 'Resolved through sibling candidate',
+                resolved_at = ?
+            WHERE intake_draft_id = ?
+              AND id != ?
+              AND status = 'PENDING';
+            """,
+            (now, row["intake_draft_id"], candidate_id),
+        )
+
         return garment_id
 
     def resolve_as_linked_similar(
         self,
         candidate_id: str,
+        garment_data: Optional[Dict[str, Any]] = None,
         resolution_note: Optional[str] = None,
-    ) -> None:
-        """Marks candidate as LINKED_SIMILAR (advisory similarity link preserved)."""
+    ) -> str:
+        """
+        Scenario 39: Keep both and link as similar.
+        Creates new Garment, attaches image, establishes durable similarity link in GarmentSimilarityLink,
+        and marks draft/candidate resolved.
+        """
+        self._require_transaction()
         now = self._utc_now()
+        cur = self.conn.execute(
+            """
+            SELECT c.*, d.temporary_image_path, f.sha256, f.perceptual_hash
+            FROM GarmentDuplicateCandidate c
+            JOIN GarmentIntakeDraft d ON c.intake_draft_id = d.id
+            JOIN GarmentIntakeFingerprint f ON f.intake_draft_id = d.id
+            WHERE c.id = ? AND c.status = 'PENDING';
+            """,
+            (candidate_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise KeyError(f"Candidate {candidate_id} not found or already resolved")
+
+        existing_id = row["existing_garment_id"]
+
+        # Fetch existing garment metadata if garment_data not fully provided
+        orig_row = self.conn.execute("SELECT * FROM Garment WHERE id = ?;", (existing_id,)).fetchone()
+        gdata = garment_data or {}
+
+        new_garment_id = gdata.get("id") or f"g_{uuid.uuid4().hex[:12]}"
+        name = gdata.get("name") or f"{orig_row['name']} (Similar)"
+        p_cat = gdata.get("physical_category") or orig_row["physical_category"]
+        subcat = gdata.get("subcategory") or orig_row["subcategory"]
+        cut = gdata.get("cut_and_fit") or orig_row["cut_and_fit"]
+        color = gdata.get("primary_color") or orig_row["primary_color"]
+        formality = gdata.get("formality") or orig_row["formality"]
+
+        # 1. Insert new Garment
+        self.conn.execute(
+            """
+            INSERT INTO Garment(
+                id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color,
+                formality, condition_state, availability_state, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CLEAN', 'AVAILABLE', ?, ?);
+            """,
+            (new_garment_id, row["user_id"], name, p_cat, subcat, cut, color, formality, now, now),
+        )
+
+        # 2. Attach Image
+        image_id = f"gi_{uuid.uuid4().hex[:12]}"
+        raw_name = Path(row["temporary_image_path"]).name
+        catalogued_path = f"catalogued/{new_garment_id}/{image_id}_{raw_name}"
+
+        src_path = Path(row["temporary_image_path"])
+        if src_path.is_file():
+            dst_path = Path(catalogued_path)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+
+        self.conn.execute(
+            """
+            INSERT INTO GarmentImage(id, garment_id, image_path, image_type, is_primary, created_at)
+            VALUES (?, ?, ?, 'full', 1, ?);
+            """,
+            (image_id, new_garment_id, catalogued_path, now),
+        )
+
+        # 3. Fingerprint
+        gif_id = f"gif_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """
+            INSERT INTO GarmentImageFingerprint(id, garment_image_id, sha256, perceptual_hash, created_at)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (gif_id, image_id, row["sha256"], row["perceptual_hash"], now),
+        )
+
+        # 4. Insert durable Similarity Link
+        gid_a, gid_b = (min(existing_id, new_garment_id), max(existing_id, new_garment_id))
+        self.conn.execute(
+            """
+            INSERT INTO GarmentSimilarityLink(garment_id_a, garment_id_b, link_type, created_at)
+            VALUES (?, ?, 'OWNER_CONFIRMED_SIMILAR', ?);
+            """,
+            (gid_a, gid_b, now),
+        )
+
+        # 5. Finalize candidate status
         res = self.conn.execute(
             """
             UPDATE GarmentDuplicateCandidate
@@ -302,7 +440,29 @@ class IntakeService:
             (resolution_note, now, candidate_id),
         )
         if res.rowcount != 1:
-            raise KeyError(f"Candidate {candidate_id} not found or already resolved")
+            raise ValueError(f"Candidate {candidate_id} is not in PENDING status")
+
+        # 6. Finalize draft status
+        self.conn.execute(
+            "UPDATE GarmentIntakeDraft SET status = 'CREATED_NEW_GARMENT' WHERE id = ?;",
+            (row["intake_draft_id"],),
+        )
+
+        # 7. Dismiss sibling candidates
+        self.conn.execute(
+            """
+            UPDATE GarmentDuplicateCandidate
+            SET status = 'DISMISSED',
+                resolution_note = 'Resolved through sibling candidate',
+                resolved_at = ?
+            WHERE intake_draft_id = ?
+              AND id != ?
+              AND status = 'PENDING';
+            """,
+            (now, row["intake_draft_id"], candidate_id),
+        )
+
+        return new_garment_id
 
     def resolve_as_dismissed(
         self,
@@ -310,6 +470,7 @@ class IntakeService:
         resolution_note: Optional[str] = None,
     ) -> None:
         """Marks candidate as DISMISSED."""
+        self._require_transaction()
         now = self._utc_now()
         res = self.conn.execute(
             """

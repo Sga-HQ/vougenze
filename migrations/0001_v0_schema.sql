@@ -593,6 +593,29 @@ CREATE TABLE PreferenceEvidenceAlternative (
 );
 
 -- ==========================================================================
+-- 14B. Similarity Links & Plan Authorization Reservations
+-- ==========================================================================
+
+CREATE TABLE GarmentSimilarityLink (
+    garment_id_a   TEXT NOT NULL REFERENCES Garment(id),
+    garment_id_b   TEXT NOT NULL REFERENCES Garment(id),
+    link_type      TEXT NOT NULL DEFAULT 'OWNER_CONFIRMED_SIMILAR',
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (garment_id_a, garment_id_b),
+    CHECK (garment_id_a < garment_id_b)
+);
+
+CREATE TABLE PlanWearAuthorizationReservation (
+    plan_id             TEXT NOT NULL REFERENCES RecommendationPlan(id),
+    session_id          TEXT NOT NULL REFERENCES WearSession(id),
+    garment_id          TEXT NOT NULL REFERENCES Garment(id),
+    authorization_id    TEXT NOT NULL REFERENCES GarmentWearAuthorization(id),
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (plan_id, session_id, garment_id),
+    UNIQUE (authorization_id)
+);
+
+-- ==========================================================================
 -- 15. Partial unique indexes (correctness invariants)
 -- ==========================================================================
 

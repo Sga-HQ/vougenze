@@ -3,13 +3,14 @@ Vougenze Wear Logging, Correction, and History Service (Frozen Spec 2.8, 2.9, 2.
 Handles immutable wear event capture with strict preflight validation, snapshotting,
 selective hard-limit authorization consumption, and chronological condition lineage replay
 on wear voiding and correction.
+Requires active transaction boundaries and enforces authoritative session metadata.
 """
 from __future__ import annotations
 import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Set
+from typing import Optional, Dict, Any, List, Set, Tuple
 
 from core.models import (
     ConditionState,
@@ -32,6 +33,10 @@ class WearService:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.state_engine = StateEngine(conn)
+
+    def _require_transaction(self) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError("Wear service operations require an active transaction")
 
     @staticmethod
     def _utc_now() -> str:
@@ -64,8 +69,8 @@ class WearService:
         session_id: str,
         garment_roles: Dict[str, str],  # role -> garment_id
         source: str = "manual_outfit",
-        session_type: str = "casual",
-        importance: str = "NORMAL",
+        session_type: Optional[str] = None,
+        importance: Optional[str] = None,
         local_wear_date: Optional[str] = None,
         timezone_id: str = "UTC",
         recommendation_plan_id: Optional[str] = None,
@@ -88,21 +93,48 @@ class WearService:
         - Every garment is AVAILABLE and not retired.
         - Every garment is CLEAN or WORN_REUSABLE.
         - Every garment satisfies its recorded role.
+        - Session row is the authoritative source for session_type, importance, and date.
+        - Plan assignment is verified against plan_id, session_id, and owner.
         - Hard-limit authorization is enforced: garments at or beyond hard_limit_wears
-          require an available authorization.
-        - Authorizations are consumed ONLY if hard limit has been reached!
+          require an available authorization, matching any plan reservation.
         """
+        self._require_transaction()
         now = self._utc_now()
-        date_str = local_wear_date or now[:10]
         log_id = f"owl_{uuid.uuid4().hex[:12]}"
 
-        # Preflight: Verify session ownership
+        # Preflight: Verify session ownership and use authoritative session fields
         s_cur = self.conn.execute("SELECT * FROM WearSession WHERE id = ?;", (session_id,))
         session = s_cur.fetchone()
         if not session:
             raise KeyError(f"WearSession {session_id} not found")
         if session["user_id"] != user_id:
             raise PermissionError("User does not own this wear session")
+
+        # Authoritative session metadata
+        eff_session_type = session["session_type"]
+        eff_importance = session["importance"]
+        eff_date_str = session["session_date"]
+
+        # Validate plan_assignment_id if provided
+        if plan_assignment_id:
+            pa_cur = self.conn.execute(
+                """
+                SELECT psa.*, rp.user_id as plan_user_id
+                FROM PlanSessionAssignment psa
+                JOIN RecommendationPlan rp ON psa.plan_id = rp.id
+                WHERE psa.id = ?;
+                """,
+                (plan_assignment_id,)
+            )
+            pa = pa_cur.fetchone()
+            if not pa:
+                raise KeyError(f"PlanSessionAssignment '{plan_assignment_id}' not found")
+            if pa["plan_user_id"] != user_id:
+                raise PermissionError("PlanSessionAssignment belongs to another user")
+            if pa["session_id"] != session_id:
+                raise ValueError("PlanSessionAssignment belongs to a different session")
+            if recommendation_plan_id and pa["plan_id"] != recommendation_plan_id:
+                raise ValueError("PlanSessionAssignment does not belong to specified recommendation_plan_id")
 
         # Preflight: Verify each garment and resolve authorizations needed
         garments_by_id: Dict[str, sqlite3.Row] = {}
@@ -131,11 +163,24 @@ class WearService:
                 effective_limit = g["hard_limit_wears"]
                 current_wears = g["wears_since_confirmed_wash"]
                 if effective_limit is not None and current_wears >= effective_limit:
-                    # Authorization is strictly required
                     auth_id = None
-                    if reserved_authorizations and gid in reserved_authorizations:
+                    # Check persistent plan reservation first
+                    if recommendation_plan_id:
+                        res_cur = self.conn.execute(
+                            """
+                            SELECT authorization_id FROM PlanWearAuthorizationReservation
+                            WHERE plan_id = ? AND session_id = ? AND garment_id = ?;
+                            """,
+                            (recommendation_plan_id, session_id, gid),
+                        )
+                        res_row = res_cur.fetchone()
+                        if res_row:
+                            auth_id = res_row["authorization_id"]
+
+                    if not auth_id and reserved_authorizations and gid in reserved_authorizations:
                         auth_id = reserved_authorizations[gid]
-                    else:
+
+                    if not auth_id:
                         auth_cur = self.conn.execute(
                             """
                             SELECT id FROM GarmentWearAuthorization
@@ -150,6 +195,16 @@ class WearService:
 
                     if not auth_id:
                         raise ValueError(f"Garment '{gid}' reached hard wear limit ({current_wears}/{effective_limit}) without wear authorization")
+
+                    # Verify authorization belongs to garment and is AVAILABLE
+                    chk_cur = self.conn.execute(
+                        "SELECT garment_id, status, consumed_by_wear_event_id FROM GarmentWearAuthorization WHERE id = ?;",
+                        (auth_id,)
+                    )
+                    chk = chk_cur.fetchone()
+                    if not chk or chk["garment_id"] != gid or chk["status"] != "AVAILABLE" or chk["consumed_by_wear_event_id"] is not None:
+                        raise ValueError(f"Authorization '{auth_id}' is not AVAILABLE or does not belong to garment '{gid}'")
+
                     auths_to_consume[gid] = auth_id
 
                 garments_by_id[gid] = g
@@ -175,10 +230,10 @@ class WearService:
                 source,
                 started_at_utc or now,
                 ended_at_utc,
-                date_str,
+                eff_date_str,
                 timezone_id,
-                session_type,
-                importance,
+                eff_session_type,
+                eff_importance,
                 was_recommended,
                 was_modified_before_wear,
                 modification_reason,
@@ -225,7 +280,8 @@ class WearService:
                 ),
             )
 
-        # 3. Create WearEvents and advance condition to WORN_AWAITING_ASSESSMENT once per distinct garment
+        # 3. Create WearEvents and advance condition
+        event_time = started_at_utc or now
         for gid, garment in garments_by_id.items():
             event_id = f"we_{uuid.uuid4().hex[:12]}"
             self.conn.execute(
@@ -233,20 +289,26 @@ class WearService:
                 INSERT INTO WearEvent(id, session_id, garment_id, outfit_wear_log_id, worn_at, is_voided)
                 VALUES (?, ?, ?, ?, ?, 0);
                 """,
-                (event_id, session_id, gid, log_id, now),
+                (event_id, session_id, gid, log_id, event_time),
             )
 
             # Consume authorization ONLY if hard limit was reached and resolved
             if gid in auths_to_consume:
-                self.conn.execute(
+                auth_id = auths_to_consume[gid]
+                res = self.conn.execute(
                     """
                     UPDATE GarmentWearAuthorization
                     SET status = 'CONSUMED',
                         consumed_by_wear_event_id = ?
-                    WHERE id = ?;
+                    WHERE id = ?
+                      AND garment_id = ?
+                      AND status = 'AVAILABLE'
+                      AND consumed_by_wear_event_id IS NULL;
                     """,
-                    (event_id, auths_to_consume[gid]),
+                    (event_id, auth_id, gid),
                 )
+                if res.rowcount != 1:
+                    raise ValueError(f"Authorization {auth_id} could not be consumed for garment {gid}")
 
             # Increment wear counter
             self.conn.execute(
@@ -256,7 +318,7 @@ class WearService:
                     last_worn_at = ?
                 WHERE id = ?;
                 """,
-                (now, gid),
+                (event_time, gid),
             )
 
             # Transition condition via StateEngine
@@ -265,7 +327,7 @@ class WearService:
                 to_state=ConditionState.WORN_AWAITING_ASSESSMENT,
                 trigger_event="logged_wear_session",
                 trigger_details={"session_id": session_id, "outfit_wear_log_id": log_id},
-                occurred_at=now,
+                occurred_at=event_time,
             )
 
         # Mark session as COMPLETED
@@ -283,6 +345,7 @@ class WearService:
         releases consumed authorizations, and reconstructs each garment's condition truth
         and wear count by replaying the chronological lineage from the last confirmed wash.
         """
+        self._require_transaction()
         now = self._utc_now()
 
         cursor = self.conn.execute(
@@ -327,11 +390,8 @@ class WearService:
 
     def reconstruct_garment_lineage(self, garment_id: str, now: str) -> None:
         """
-        Replays chronological event stream from last full wash across active wear events,
-        operative post-wear assessments, and partial cleans to recompute:
-        - wears_since_confirmed_wash
-        - last_worn_at
-        - condition_state
+        Reconstructs wear count, last wear and condition from full washes plus active wear events
+        and their operative post-wear assessments.
         """
         # Find last confirmed full wash
         wash_cur = self.conn.execute(
@@ -373,7 +433,6 @@ class WearService:
         if wear_count == 0:
             reconstructed_condition = ConditionState.CLEAN.value
         else:
-            # Check latest active wear event's operative assessment
             latest_event_id = active_events[-1]["id"]
             pwa_cur = self.conn.execute(
                 "SELECT assessment FROM PostWearAssessment WHERE wear_event_id = ?;",
@@ -416,7 +475,9 @@ class WearService:
     ) -> str:
         """
         Scenario 30: Corrects a wear log by voiding the original and creating an active replacement.
+        Preserves original wear chronology (started_at_utc and ended_at_utc).
         """
+        self._require_transaction()
         orig_cur = self.conn.execute(
             "SELECT * FROM OutfitWearLog WHERE id = ?;", (original_log_id,)
         )
@@ -427,7 +488,7 @@ class WearService:
         # Void original
         self.void_outfit_wear(original_log_id, f"Corrected: {correction_reason}")
 
-        # Create replacement log
+        # Create replacement log preserving original wear chronology
         new_log_id = self.log_outfit_wear(
             user_id=orig["user_id"],
             session_id=orig["session_id"],
@@ -447,10 +508,13 @@ class WearService:
             occasion_fit_rating=kwargs.get("occasion_fit_rating", orig["occasion_fit_rating"]),
             would_wear_again=kwargs.get("would_wear_again", orig["would_wear_again"]),
             feedback_notes=kwargs.get("feedback_notes", orig["feedback_notes"]),
+            started_at_utc=orig["started_at_utc"],
+            ended_at_utc=orig["ended_at_utc"],
         )
 
+        # Link superseded_by_id on original
         self.conn.execute(
-            "UPDATE OutfitWearLog SET superseded_by_id = ?, record_status = 'CORRECTED' WHERE id = ?;",
+            "UPDATE OutfitWearLog SET superseded_by_id = ? WHERE id = ?;",
             (new_log_id, original_log_id),
         )
 
@@ -459,42 +523,47 @@ class WearService:
     def query_active_history(
         self,
         user_id: str,
-        reference_date: str,  # YYYY-MM-DD
-        window_days: int = 100,
+        before_date: Optional[str] = None,
+        window_days: int = 14,
+        reference_date: Optional[str] = None,
     ) -> List[sqlite3.Row]:
-        """
-        Scenario 24: Queries wear history within active planning window (default 100 local days).
-        Omits voided/superseded wear records.
-        """
-        if window_days == -1:
-            cursor = self.conn.execute(
+        """Returns non-voided OutfitWearLog records in window before before_date / reference_date."""
+        ref_date = reference_date or before_date
+        if ref_date is None:
+            raise ValueError("Must provide either before_date or reference_date")
+        if window_days is not None and window_days >= 0:
+            cur = self.conn.execute(
                 """
-                SELECT * FROM OutfitWearLog
-                WHERE user_id = ? AND record_status = 'ACTIVE'
-                ORDER BY local_wear_date DESC;
+                SELECT owl.* FROM OutfitWearLog owl
+                WHERE owl.user_id = ?
+                  AND owl.record_status = 'ACTIVE'
+                  AND owl.local_wear_date <= ?
+                  AND owl.local_wear_date >= date(?, '-' || ? || ' days')
+                ORDER BY owl.local_wear_date DESC;
                 """,
-                (user_id,),
+                (user_id, ref_date, ref_date, window_days),
             )
         else:
-            cursor = self.conn.execute(
+            cur = self.conn.execute(
                 """
-                SELECT * FROM OutfitWearLog
-                WHERE user_id = ? AND record_status = 'ACTIVE'
-                  AND local_wear_date >= date(?, '-' || ? || ' days')
-                  AND local_wear_date <= ?
-                ORDER BY local_wear_date DESC;
+                SELECT owl.* FROM OutfitWearLog owl
+                WHERE owl.user_id = ?
+                  AND owl.record_status = 'ACTIVE'
+                  AND owl.local_wear_date <= ?
+                ORDER BY owl.local_wear_date DESC;
                 """,
-                (user_id, reference_date, window_days, reference_date),
+                (user_id, ref_date),
             )
-        return cursor.fetchall()
+        return cur.fetchall()
 
     def retire_garment(self, garment_id: str, reason: str = "Retired by owner") -> None:
-        """
-        Scenario 23: Retires a garment and atomically invalidates all active proposed/reserved plans referencing it.
-        Uses StateEngine for governed state transition and audit trail.
-        """
+        """Scenario 23: Retires a garment and atomically invalidates all active proposed/reserved plans referencing it."""
+        self._require_transaction()
         now = self._utc_now()
-        # Transition availability to RETIRED via StateEngine
+        g = self.state_engine.get_garment(garment_id)
+        if g["availability_state"] == AvailabilityState.RETIRED.value:
+            raise ValueError(f"Garment {garment_id} is already RETIRED")
+
         self.state_engine.transition_availability(
             garment_id=garment_id,
             to_state=AvailabilityState.RETIRED,
@@ -503,7 +572,7 @@ class WearService:
             occurred_at=now,
         )
 
-        # Invalidate plans
+        # Invalidate proposed and reserved plans referencing this garment
         plans_cur = self.conn.execute(
             """
             SELECT DISTINCT psa.plan_id

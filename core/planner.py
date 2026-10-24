@@ -1,8 +1,8 @@
 """
 Vougenze Bounded Continuation Planner & Multi-Strategy Engine (Frozen Spec 2.14, Part 4).
 Implements beam search across the planning horizon, strict ascending lexicographic ranking,
-within-plan repetition propagation, hard-limit authorization reservations,
-feasible-substitute counting, and slot-by-slot strategy diversity relative to Safe.
+within-plan repetition propagation, (session_id, garment_id) hard-limit authorization reservations,
+persisted plan reservations, candidate-specific substitute counting, and enforced strategy diversity.
 """
 from __future__ import annotations
 import copy
@@ -18,6 +18,7 @@ from core.models import (
     PlanStatus,
     InvalidationReason,
     OutfitCandidate,
+    RecommendationPlan,
     AvailabilityState,
 )
 from core.candidate_generator import CandidateGenerator
@@ -31,7 +32,8 @@ class PartialPlan:
     assignments: Dict[str, OutfitCandidate] = field(default_factory=dict)  # session_id -> candidate
     simulated_wears: Dict[str, int] = field(default_factory=dict)  # garment_id -> wear_count
     simulated_last_worn: Dict[str, str] = field(default_factory=dict)  # garment_id -> session_date
-    reserved_authorizations: Dict[str, str] = field(default_factory=dict)  # (sid, gid) or gid -> auth_id
+    reserved_authorizations: Dict[Tuple[str, str], str] = field(default_factory=dict)  # (sid, gid) -> auth_id
+    diversity_progress: int = 0
     uncovered_high: int = 0
     uncovered_normal: int = 0
     uncovered_low: int = 0
@@ -54,17 +56,26 @@ class ContinuationPlanner:
     def _utc_now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    def _require_transaction(self) -> None:
+        if not self.conn.in_transaction:
+            raise RuntimeError("Planner operations require an active transaction")
+
     @staticmethod
-    def plan_ranking_key(p: PartialPlan) -> tuple:
-        """Frozen ascending lexicographic ranking key:
-        (uncovered_high, uncovered_normal, uncovered_low, uncertain_dependencies, fallback_count, -min_high_quality, -total_quality, total_repetition)
+    def plan_ranking_key(p: PartialPlan, target_diversity: int = 0) -> tuple:
         """
+        Ascending lexicographic ranking key enforcing:
+        1. Feasibility (uncovered high, normal, low, uncertain dependencies, fallback items)
+        2. Attainable diversity target deficit (for Balanced / Exploratory relative to Safe)
+        3. Quality and repetition (-min_high_quality, -total_quality, total_repetition)
+        """
+        diversity_deficit = max(0, target_diversity - p.diversity_progress)
         return (
             p.uncovered_high,
             p.uncovered_normal,
             p.uncovered_low,
             p.uncertain_dependencies,
             p.fallback_count,
+            diversity_deficit,
             -p.min_high_quality,
             -p.total_quality,
             p.total_repetition,
@@ -82,7 +93,9 @@ class ContinuationPlanner:
         """
         Executes bounded continuation planning across the horizon.
         Uses ascending lexicographic ranking and within-plan repetition.
+        Persists authorization reservations and enforces attainable strategy diversity.
         """
+        self._require_transaction()
         # 1. Fetch sessions
         sessions_cur = self.conn.execute(
             """
@@ -98,20 +111,36 @@ class ContinuationPlanner:
 
         history = self.wear_service.query_active_history(user_id, horizon_start_date, window_days=100)
 
-        # Scorer weights
+        # Common base quality definition
         weights = ScoringWeights()
-        if strategy_mode == StrategyMode.SAFE:
-            weights.w_repetition = 0.15
-            weights.w_compatibility = 0.40
-            weights.w_occasion = 0.35
-            weights.w_preference = 0.25
-        elif strategy_mode == StrategyMode.EXPLORATORY:
-            weights.w_preference = 0.35
-            weights.w_occasion = 0.35
-            weights.w_compatibility = 0.30
+        weights.w_compatibility = 0.30
+        weights.w_occasion = 0.35
+        weights.w_preference = 0.25
+        weights.w_repetition = 0.10
         scorer = DeterministicScorer(self.conn, weights)
 
-        # 2. Beam Search Initialization
+        # 2. Determine attainable diversity target relative to Safe
+        sessions_with_alternatives = 0
+        eligible_low_normal_sessions = 0
+        all_session_candidates: Dict[str, List[OutfitCandidate]] = {}
+
+        for session in sessions:
+            sid = session["id"]
+            cands = self.candidate_generator.generate_candidates(sid, user_id=user_id)
+            all_session_candidates[sid] = cands
+            if len(cands) >= 2:
+                sessions_with_alternatives += 1
+            if session["importance"] in ("LOW", "NORMAL"):
+                eligible_low_normal_sessions += 1
+
+        if strategy_mode == StrategyMode.SAFE or not reference_safe_assignments:
+            attainable_target = 0
+        elif strategy_mode == StrategyMode.BALANCED:
+            attainable_target = min(2, sessions_with_alternatives)
+        else:  # EXPLORATORY
+            attainable_target = min(3, eligible_low_normal_sessions)
+
+        # 3. Beam Search Initialization
         initial_plan = PartialPlan()
         g_cur = self.conn.execute(
             "SELECT id, wears_since_confirmed_wash FROM Garment WHERE user_id = ?;", (user_id,)
@@ -129,17 +158,8 @@ class ContinuationPlanner:
         for session in sessions:
             sid = session["id"]
             importance = session["importance"]
+            candidates = all_session_candidates.get(sid, [])
             next_beam: List[PartialPlan] = []
-
-            # Generate all structurally valid candidates for this session
-            candidates = self.candidate_generator.generate_candidates(sid, user_id=user_id)
-
-            # Compute feasible substitute counts per role for this session
-            substitute_counts: Dict[str, Set[str]] = {}
-            for cand in candidates:
-                for role, gid in cand.roles.items():
-                    substitute_counts.setdefault(role, set()).add(gid)
-            feasible_substitute_counts = {role: len(gids) for role, gids in substitute_counts.items()}
 
             for partial in beam:
                 # Within-plan simulated wear history for repetition scoring
@@ -153,15 +173,15 @@ class ContinuationPlanner:
                 ]
 
                 # Filter candidates feasible under partial plan's simulated wear and authorizations
-                feasible_candidates: List[Tuple[OutfitCandidate, Dict[str, str]]] = []
+                feasible_candidates: List[Tuple[OutfitCandidate, Dict[Tuple[str, str], str]]] = []
                 for cand in candidates:
                     cand_feasible = True
-                    needed_auths: Dict[str, str] = {}
+                    needed_auths: Dict[Tuple[str, str], str] = {}
                     for gid in cand.garment_ids:
                         sim_wears = partial.simulated_wears.get(gid, 0)
                         hl = hard_limits.get(gid)
                         if hl is not None and sim_wears >= hl:
-                            # Must reserve an available authorization not already reserved in this path
+                            # Reserve distinct authorization per (sid, gid)
                             reserved_auth_ids = set(partial.reserved_authorizations.values())
                             auth_cur = self.conn.execute(
                                 """
@@ -174,11 +194,11 @@ class ContinuationPlanner:
                             auth_rows = auth_cur.fetchall()
                             usable_auth = None
                             for a in auth_rows:
-                                if a["id"] not in reserved_auth_ids:
+                                if a["id"] not in reserved_auth_ids and a["id"] not in needed_auths.values():
                                     usable_auth = a["id"]
                                     break
                             if usable_auth:
-                                needed_auths[gid] = usable_auth
+                                needed_auths[(sid, gid)] = usable_auth
                             else:
                                 cand_feasible = False
                                 break
@@ -198,23 +218,26 @@ class ContinuationPlanner:
                     next_beam.append(p_copy)
                     continue
 
+                path_cands = [fc[0] for fc in feasible_candidates]
+
                 for cand, needed_auths in feasible_candidates:
-                    # Score candidate in context of this partial plan path
+                    # Scenario 28: Selected-candidate-specific complete outfit substitutes
+                    substitutes = CandidateGenerator.compute_candidate_substitutes(path_cands, cand)
+
                     q = scorer.score_candidate(
                         candidate=cand,
                         session=session,
                         recent_wear_history=history,
-                        feasible_substitute_counts=feasible_substitute_counts,
+                        feasible_substitute_counts=substitutes,
                         simulated_wear_history=sim_history,
                     )
 
                     effective_q = q
-                    if strategy_mode == StrategyMode.EXPLORATORY:
-                        if importance in ("LOW", "NORMAL"):
-                            novelty_bonus = sum(
-                                0.05 for gid in cand.garment_ids if partial.simulated_wears.get(gid, 0) == 0
-                            )
-                            effective_q += novelty_bonus
+                    if strategy_mode == StrategyMode.EXPLORATORY and importance in ("LOW", "NORMAL"):
+                        novelty_bonus = sum(
+                            0.05 for gid in cand.garment_ids if partial.simulated_wears.get(gid, 0) == 0
+                        )
+                        effective_q += novelty_bonus
 
                     p_next = copy.deepcopy(partial)
                     p_next.assignments[sid] = cand
@@ -222,6 +245,15 @@ class ContinuationPlanner:
                     p_next.total_quality += effective_q
                     p_next.total_repetition += cand.repetition_penalty
                     p_next.fallback_count += cand.fallback_count
+
+                    # Track slot-level diversity progress against reference Safe plan
+                    if reference_safe_assignments and sid in reference_safe_assignments:
+                        cand_sig = tuple(sorted(cand.garment_ids))
+                        if cand_sig != reference_safe_assignments[sid]:
+                            if strategy_mode == StrategyMode.BALANCED:
+                                p_next.diversity_progress += 1
+                            elif strategy_mode == StrategyMode.EXPLORATORY and importance in ("LOW", "NORMAL"):
+                                p_next.diversity_progress += 1
 
                     if importance == "HIGH":
                         p_next.min_high_quality = min(p_next.min_high_quality, effective_q)
@@ -233,13 +265,12 @@ class ContinuationPlanner:
 
                     next_beam.append(p_next)
 
-            next_beam.sort(key=self.plan_ranking_key)
+            next_beam.sort(key=lambda p: self.plan_ranking_key(p, attainable_target))
             beam = next_beam[:beam_width]
 
         best_partial = beam[0] if beam else PartialPlan()
 
-        # 3. Strategy Diversity Calculation
-        # Safe is baseline; Balanced and Exploratory measure diversity slot-by-slot relative to Safe
+        # 4. Strategy Diversity Calculation
         current_signatures = {
             sid: tuple(sorted(cand.garment_ids))
             for sid, cand in best_partial.assignments.items()
@@ -255,12 +286,11 @@ class ContinuationPlanner:
             unique_outfits = set(current_signatures.values())
             diversity_achieved = max(0, len(unique_outfits) - 1)
 
-        diversity_target = 2 if strategy_mode == StrategyMode.EXPLORATORY else 1
         diversity_notes = "Normal multi-outfit rotation"
         if len(set(current_signatures.values())) <= 1:
             diversity_notes = "Limited wardrobe: exactly 1 valid outfit configuration available"
 
-        # 4. Persist RecommendationPlan
+        # 5. Persist RecommendationPlan
         plan_id = f"rp_{uuid.uuid4().hex[:12]}"
         now = self._utc_now()
 
@@ -278,7 +308,7 @@ class ContinuationPlanner:
                 strategy_mode.value,
                 horizon_start_date,
                 horizon_end_date,
-                diversity_target,
+                attainable_target,
                 diversity_achieved,
                 diversity_notes,
                 now,
@@ -341,8 +371,85 @@ class ContinuationPlanner:
                     (assign_id, gid, role),
                 )
 
+        # Persist PlanWearAuthorizationReservation
+        for (res_sid, res_gid), auth_id in best_partial.reserved_authorizations.items():
+            self.conn.execute(
+                """
+                INSERT INTO PlanWearAuthorizationReservation(
+                    plan_id, session_id, garment_id, authorization_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (plan_id, res_sid, res_gid, auth_id, now),
+            )
+
         return plan_id
 
     def retire_garment(self, garment_id: str, reason: str = "Retired by owner") -> None:
         """Scenario 23: Retires a garment and atomically invalidates all active proposed/reserved plans referencing it."""
         self.wear_service.retire_garment(garment_id, reason)
+
+    def get_plan(self, plan_id: str) -> RecommendationPlan:
+        """Loads RecommendationPlan and its assignments from the database."""
+        p_row = self.conn.execute("SELECT * FROM RecommendationPlan WHERE id = ?;", (plan_id,)).fetchone()
+        if not p_row:
+            raise KeyError(f"RecommendationPlan '{plan_id}' not found")
+
+        assign_cur = self.conn.execute(
+            """
+            SELECT psa.*, pai.garment_id, pai.outfit_role
+            FROM PlanSessionAssignment psa
+            JOIN PlanAssignmentItem pai ON psa.id = pai.assignment_id
+            WHERE psa.plan_id = ?
+            ORDER BY psa.session_id, pai.outfit_role;
+            """,
+            (plan_id,),
+        )
+        assignments_by_sid: Dict[str, Dict[str, Any]] = {}
+        for r in assign_cur.fetchall():
+            sid = r["session_id"]
+            if sid not in assignments_by_sid:
+                assignments_by_sid[sid] = {
+                    "id": r["id"],
+                    "roles": {},
+                    "garment_ids": [],
+                    "quality_score": r["quality_score"],
+                    "compatibility_score": r["compatibility_score"],
+                    "preference_score": r["preference_score"],
+                    "repetition_penalty": r["repetition_penalty"],
+                    "is_fallback": bool(r["is_fallback"]),
+                }
+            assignments_by_sid[sid]["roles"][r["outfit_role"]] = r["garment_id"]
+            if r["garment_id"] not in assignments_by_sid[sid]["garment_ids"]:
+                assignments_by_sid[sid]["garment_ids"].append(r["garment_id"])
+
+        cands = {
+            sid: OutfitCandidate(
+                id=d["id"],
+                garment_ids=d["garment_ids"],
+                roles=d["roles"],
+                quality_score=d["quality_score"],
+                compatibility_score=d["compatibility_score"],
+                preference_score=d["preference_score"],
+                repetition_penalty=d["repetition_penalty"],
+                is_fallback=d["is_fallback"],
+            )
+            for sid, d in assignments_by_sid.items()
+        }
+
+        return RecommendationPlan(
+            id=p_row["id"],
+            user_id=p_row["user_id"],
+            strategy_mode=StrategyMode(p_row["strategy_mode"]),
+            horizon_start_date=p_row["horizon_start_date"],
+            horizon_end_date=p_row["horizon_end_date"],
+            status=PlanStatus(p_row["status"]),
+            invalidation_reason=InvalidationReason(p_row["invalidation_reason"]) if p_row["invalidation_reason"] else None,
+            superseded_by_id=p_row["superseded_by_id"],
+            plan_input_fingerprint=p_row["plan_input_fingerprint"],
+            diversity_target=p_row["diversity_target"],
+            diversity_achieved=p_row["diversity_achieved"],
+            diversity_notes=p_row["diversity_notes"],
+            assignments=cands,
+            created_at=p_row["created_at"],
+        )
