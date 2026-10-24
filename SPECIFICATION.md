@@ -3,9 +3,9 @@
 > [!IMPORTANT]
 > **Status: FROZEN FOR V0 IMPLEMENTATION**  
 > **Frozen by: Owner**  
-> **Frozen at: 2026-10-23T19:44:00Z**  
-> **Specification revision: 2.2.1-final**  
-> **Specification SHA-256: 5C7AD22FF665B5890AA1973E21B90E6A9AA3A83002217E5EF0187ED064FCBBEA**  
+> **Frozen at: 2026-10-24T04:47:00Z**  
+> **Specification revision: 2.2.1-final.1**  
+> **Specification SHA-256: CE715D37CAB49FAE68FEBDF549CAFF149794DDB958F59C187470943542F643AD**  
 >
 > **Authorized implementation scope:**
 > - SQLite schema and migrations
