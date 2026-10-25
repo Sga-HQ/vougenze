@@ -1,0 +1,4 @@
+# Test and research dependencies only (Pass 1: Hypothesis research pass)
+# Pinned for Python 3.14.6 compatibility
+hypothesis==6.170.9
+sortedcontainers==2.4.0
