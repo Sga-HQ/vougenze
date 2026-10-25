@@ -194,5 +194,53 @@ class TestWearService(unittest.TestCase):
             self.assertIn("2025-11-30", all_dates)
 
 
+    def test_vzw2_modified_wear_requires_nonblank_reason(self):
+        """
+        Deterministic regression for VZ-W2:
+        was_modified_before_wear = True MUST require a non-empty, non-whitespace modification_reason.
+        Tests that None, empty string, and whitespace-only strings raise ValueError,
+        while a trimmed valid reason succeeds and persists.
+        """
+        roles = {"top": self.shirt_id, "bottom": self.jeans_id, "footwear": self.shoes_id}
+
+        # 1. Blank reasons must raise ValueError
+        for blank_reason in [None, "", "   ", "\t\n", " \r\n "]:
+            with self.subTest(blank_reason=blank_reason):
+                with self.assertRaises(ValueError) as cm:
+                    with self.db.transaction() as conn:
+                        service = WearService(conn)
+                        service.log_outfit_wear(
+                            user_id=self.user_id,
+                            session_id=self.session_id,
+                            garment_roles=roles,
+                            was_recommended=True,
+                            was_modified_before_wear=True,
+                            modification_reason=blank_reason,
+                        )
+                self.assertIn("non-empty modification_reason", str(cm.exception))
+
+        # 2. Valid trimmed reason must succeed and persist
+        valid_reason = "  Replaced recommended shoes with boots due to rain  "
+        with self.db.transaction() as conn:
+            service = WearService(conn)
+            log_id = service.log_outfit_wear(
+                user_id=self.user_id,
+                session_id=self.session_id,
+                garment_roles=roles,
+                was_recommended=True,
+                was_modified_before_wear=True,
+                modification_reason=valid_reason,
+            )
+
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT was_modified_before_wear, modification_reason FROM OutfitWearLog WHERE id = ?;",
+                (log_id,),
+            ).fetchone()
+            self.assertEqual(row["was_modified_before_wear"], 1)
+            self.assertEqual(row["modification_reason"], valid_reason)
+
+
 if __name__ == "__main__":
     unittest.main()
+
