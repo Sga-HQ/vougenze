@@ -39,3 +39,4 @@ wardrobe_images/
 private_data/
 model_weights/
 checkpoints/
+*.zip
