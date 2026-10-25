@@ -228,10 +228,10 @@ class TestContinuationPlanner(unittest.TestCase):
                 eval_row["uncovered_low"],
                 eval_row["uncertain_dependencies"],
                 eval_row["fallback_assignments"],
-                0,  # diversity_deficit
                 -round(eval_row["min_high_importance_quality"], 4),
                 -round(eval_row["total_quality"], 4),
                 round(eval_row["repetition_burden"], 4),
+                0,  # diversity_deficit
             )
             oracle_key_rounded = (
                 oracle_best_key[0],

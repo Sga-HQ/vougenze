@@ -77,10 +77,10 @@ class ContinuationPlanner:
             p.uncovered_low,
             p.uncertain_dependencies,
             p.fallback_count,
-            diversity_deficit,
             -high_floor,
             -p.total_quality,
             p.total_repetition,
+            diversity_deficit,
         )
 
     def generate_plan(
