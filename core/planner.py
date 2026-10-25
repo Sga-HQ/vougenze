@@ -61,14 +61,15 @@ class ContinuationPlanner:
             raise RuntimeError("Planner operations require an active transaction")
 
     @staticmethod
-    def plan_ranking_key(p: PartialPlan, target_diversity: int = 0) -> tuple:
+    def plan_ranking_key(p: PartialPlan, target_diversity: int = 0, attainable_target: Optional[int] = None) -> tuple:
         """
         Ascending lexicographic ranking key enforcing:
         1. Feasibility (uncovered high, normal, low, uncertain dependencies, fallback items)
         2. Attainable diversity target deficit (for Balanced / Exploratory relative to Safe)
         3. Quality and repetition (-min_high_quality, -total_quality, total_repetition)
         """
-        diversity_deficit = max(0, target_diversity - p.diversity_progress)
+        target = attainable_target if attainable_target is not None else target_diversity
+        diversity_deficit = max(0, target - p.diversity_progress)
         return (
             p.uncovered_high,
             p.uncovered_normal,
@@ -185,9 +186,15 @@ class ContinuationPlanner:
                             reserved_auth_ids = set(partial.reserved_authorizations.values())
                             auth_cur = self.conn.execute(
                                 """
-                                SELECT id FROM GarmentWearAuthorization
-                                WHERE garment_id = ? AND status = 'AVAILABLE' AND consumed_by_wear_event_id IS NULL
-                                ORDER BY authorized_at ASC;
+                                SELECT gwa.id FROM GarmentWearAuthorization gwa
+                                WHERE gwa.garment_id = ? AND gwa.status = 'AVAILABLE' AND gwa.consumed_by_wear_event_id IS NULL
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM PlanWearAuthorizationReservation pwar
+                                      JOIN RecommendationPlan rp ON pwar.plan_id = rp.id
+                                      WHERE pwar.authorization_id = gwa.id
+                                        AND rp.status IN ('PROPOSED', 'RESERVED')
+                                  )
+                                ORDER BY gwa.authorized_at ASC;
                                 """,
                                 (gid,),
                             )
@@ -224,8 +231,12 @@ class ContinuationPlanner:
                     # Scenario 28: Selected-candidate-specific complete outfit substitutes
                     substitutes = CandidateGenerator.compute_candidate_substitutes(path_cands, cand)
 
+                    # VZ-P1: Evaluate path-isolated copy so path-dependent scoring
+                    # does not mutate the shared OutfitCandidate across different beam paths
+                    evaluated_cand = copy.deepcopy(cand)
+
                     q = scorer.score_candidate(
-                        candidate=cand,
+                        candidate=evaluated_cand,
                         session=session,
                         recent_wear_history=history,
                         feasible_substitute_counts=substitutes,
@@ -235,20 +246,20 @@ class ContinuationPlanner:
                     effective_q = q
                     if strategy_mode == StrategyMode.EXPLORATORY and importance in ("LOW", "NORMAL"):
                         novelty_bonus = sum(
-                            0.05 for gid in cand.garment_ids if partial.simulated_wears.get(gid, 0) == 0
+                            0.05 for gid in evaluated_cand.garment_ids if partial.simulated_wears.get(gid, 0) == 0
                         )
                         effective_q += novelty_bonus
 
                     p_next = copy.deepcopy(partial)
-                    p_next.assignments[sid] = cand
+                    p_next.assignments[sid] = evaluated_cand
                     p_next.reserved_authorizations.update(needed_auths)
                     p_next.total_quality += effective_q
-                    p_next.total_repetition += cand.repetition_penalty
-                    p_next.fallback_count += cand.fallback_count
+                    p_next.total_repetition += evaluated_cand.repetition_penalty
+                    p_next.fallback_count += evaluated_cand.fallback_count
 
                     # Track slot-level diversity progress against reference Safe plan
                     if reference_safe_assignments and sid in reference_safe_assignments:
-                        cand_sig = tuple(sorted(cand.garment_ids))
+                        cand_sig = tuple(sorted(evaluated_cand.garment_ids))
                         if cand_sig != reference_safe_assignments[sid]:
                             if strategy_mode == StrategyMode.BALANCED:
                                 p_next.diversity_progress += 1
@@ -259,7 +270,7 @@ class ContinuationPlanner:
                         p_next.min_high_quality = min(p_next.min_high_quality, effective_q)
 
                     # Advance simulated wear state
-                    for gid in cand.garment_ids:
+                    for gid in evaluated_cand.garment_ids:
                         p_next.simulated_wears[gid] = p_next.simulated_wears.get(gid, 0) + 1
                         p_next.simulated_last_worn[gid] = session["session_date"]
 
@@ -373,6 +384,14 @@ class ContinuationPlanner:
 
         # Persist PlanWearAuthorizationReservation
         for (res_sid, res_gid), auth_id in best_partial.reserved_authorizations.items():
+            if res_sid not in best_partial.assignments or res_gid not in best_partial.assignments[res_sid].garment_ids:
+                continue
+            auth_check = self.conn.execute(
+                "SELECT id FROM GarmentWearAuthorization WHERE id = ? AND garment_id = ? AND status = 'AVAILABLE';",
+                (auth_id, res_gid),
+            ).fetchone()
+            if not auth_check:
+                raise ValueError(f"Authorization {auth_id} does not belong to garment {res_gid} or is not AVAILABLE")
             self.conn.execute(
                 """
                 INSERT INTO PlanWearAuthorizationReservation(
@@ -384,6 +403,18 @@ class ContinuationPlanner:
             )
 
         return plan_id
+
+    def supersede_plan(self, plan_id: str, reason: str = "SUPERSEDED") -> None:
+        """Explicitly supersedes a plan and releases its authorization reservations."""
+        self._require_transaction()
+        self.conn.execute(
+            "UPDATE RecommendationPlan SET status = 'SUPERSEDED', invalidation_reason = ? WHERE id = ?;",
+            (reason, plan_id),
+        )
+        self.conn.execute(
+            "DELETE FROM PlanWearAuthorizationReservation WHERE plan_id = ?;",
+            (plan_id,),
+        )
 
     def retire_garment(self, garment_id: str, reason: str = "Retired by owner") -> None:
         """Scenario 23: Retires a garment and atomically invalidates all active proposed/reserved plans referencing it."""

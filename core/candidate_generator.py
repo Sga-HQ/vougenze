@@ -94,74 +94,6 @@ class CandidateGenerator:
     # stage 2 (ContinuationPlanner beam search) enforces path-specific operational availability.
     structurally_possible_candidates = generate_candidates
 
-    def _truncate_role_pool(
-        self,
-        pool: List[sqlite3.Row],
-        session_type: str,
-        max_items: int = MAX_ROLE_ITEMS,
-    ) -> List[sqlite3.Row]:
-        """
-        Bounded-retention policy:
-        1. Retains all items uniquely eligible for HIGH-importance sessions (formality >= 4, presentation/office).
-        2. Retains at least one item per distinct eligibility signature.
-        3. Fills remaining quota up to max_items by like rating.
-        """
-        if len(pool) <= max_items:
-            return pool
-
-        retained: List[sqlite3.Row] = []
-        seen_ids: Set[str] = set()
-
-        # 1. Retain critical/high-importance items
-        for g in pool:
-            formality = int(g["formality"] or 3)
-            contexts = json.loads(g["usage_contexts"] or "[]")
-            is_critical = (
-                formality >= 4
-                or "presentation" in contexts
-                or "formal" in contexts
-                or "office" in contexts
-            )
-            if is_critical and g["id"] not in seen_ids:
-                retained.append(g)
-                seen_ids.add(g["id"])
-
-        # 2. Retain at least one item per distinct eligibility signature
-        for g in pool:
-            if g["id"] in seen_ids:
-                continue
-            sig = (
-                int(g["formality"] or 3),
-                g["priority_level"],
-                g["cut_and_fit"],
-                tuple(sorted(json.loads(g["usage_contexts"] or "[]"))),
-            )
-            already_represented = any(
-                (
-                    int(rg["formality"] or 3),
-                    rg["priority_level"],
-                    rg["cut_and_fit"],
-                    tuple(sorted(json.loads(rg["usage_contexts"] or "[]"))),
-                ) == sig
-                for rg in retained
-            )
-            if not already_represented:
-                retained.append(g)
-                seen_ids.add(g["id"])
-
-        # 3. Fill remaining capacity up to max_items by like rating
-        remaining = [g for g in pool if g["id"] not in seen_ids]
-        remaining.sort(key=lambda g: (-int(g["like_rating"] or 5), g["id"]))
-
-        needed = max_items - len(retained)
-        if needed > 0:
-            retained.extend(remaining[:needed])
-        elif len(retained) > max_items:
-            retained.sort(key=lambda g: (-int(g["like_rating"] or 5), g["id"]))
-            retained = retained[:max_items]
-
-        return retained
-
     def _build_candidates(
         self,
         all_garments: List[sqlite3.Row],
@@ -172,9 +104,29 @@ class CandidateGenerator:
         excluded_garment_ids: Optional[Set[str]] = None,
     ) -> List[OutfitCandidate]:
         """Filters garments and combines them into role-complete outfits with protected quotas."""
+        # Check if an OccasionProfile exists for this user and session_type
+        user_id = all_garments[0]["user_id"] if all_garments else None
+        occ_row = None
+        if user_id:
+            occ_row = self.conn.execute(
+                "SELECT * FROM OccasionProfile WHERE user_id = ? AND name = ?;", (user_id, session_type)
+            ).fetchone()
+
+        min_formality = occ_row["formality_min"] if occ_row and occ_row["formality_min"] is not None else 1
+        max_formality = occ_row["formality_max"] if occ_row and occ_row["formality_max"] is not None else 5
+        prohibited = set(json.loads(occ_row["prohibited_items"] or "[]")) if occ_row else set()
+
         # 1. Filter eligible garments
         eligible: List[sqlite3.Row] = []
         for g in all_garments:
+            # Occasion Profile admissibility check
+            if occ_row:
+                g_f = g["formality"] if g["formality"] is not None else 2
+                if not (min_formality <= g_f <= max_formality):
+                    continue
+                if g["subcategory"] in prohibited or g["physical_category"] in prohibited or g["id"] in prohibited:
+                    continue
+
             # Physical availability check
             if g["availability_state"] != AvailabilityState.AVAILABLE.value:
                 continue

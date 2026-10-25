@@ -1190,18 +1190,26 @@ class TestP0P1Invariants(unittest.TestCase):
         with self.db.transaction() as conn:
             for i in range(1, 4):
                 conn.execute(
-                    f"INSERT INTO WearSession(id, user_id, session_date, session_type) VALUES ('ws_div_{i}', ?, '2026-03-0{i}', 'casual');",
+                    f"INSERT INTO WearSession(id, user_id, session_date, session_type, importance, required_roles) "
+                    f"VALUES ('ws_div_{i}', ?, '2026-03-0{i}', 'casual', 'NORMAL', '[\"top\", \"bottom\", \"footwear\"]');",
                     (self.user_id,),
                 )
             for i in range(1, 4):
                 conn.execute(
-                    f"INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) VALUES ('g_t_div_{i}', ?, 'T{i}', 'top', 'shirt', 'regular', 'c{i}', 2, 8);",
+                    f"INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                    f"VALUES ('g_t_div_{i}', ?, 'T{i}', 'top', 'shirt', 'regular', 'c{i}', 2, {9 - i});",
                     (self.user_id,),
                 )
                 conn.execute(
-                    f"INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) VALUES ('g_b_div_{i}', ?, 'B{i}', 'bottom', 'pants', 'regular', 'c{i}', 2, 8);",
+                    f"INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                    f"VALUES ('g_b_div_{i}', ?, 'B{i}', 'bottom', 'pants', 'regular', 'c{i}', 2, {9 - i});",
                     (self.user_id,),
                 )
+            conn.execute(
+                "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                "VALUES ('g_s_div', ?, 'Shoes', 'footwear', 'sneakers', 'regular', 'white', 2, 8);",
+                (self.user_id,),
+            )
 
             planner = ContinuationPlanner(conn)
             safe_plan_id = planner.generate_plan(self.user_id, "2026-03-01", "2026-03-03", StrategyMode.SAFE)
@@ -1224,9 +1232,33 @@ class TestP0P1Invariants(unittest.TestCase):
                 reference_safe_assignments=safe_assignments
             )
 
-            bal_plan = conn.execute("SELECT diversity_achieved FROM RecommendationPlan WHERE id = ?;", (bal_plan_id,)).fetchone()
-            self.assertIsNotNone(bal_plan["diversity_achieved"])
-            self.assertGreaterEqual(bal_plan["diversity_achieved"], 0.0)
+            bal_plan_row = conn.execute("SELECT diversity_achieved, diversity_target FROM RecommendationPlan WHERE id = ?;", (bal_plan_id,)).fetchone()
+            self.assertIsNotNone(bal_plan_row["diversity_achieved"])
+
+            bal_assignments = {
+                r["session_id"]: tuple(sorted(r["garment_ids"].split(",")))
+                for r in conn.execute(
+                    """
+                    SELECT psa.session_id, group_concat(pai.garment_id) as garment_ids
+                    FROM PlanSessionAssignment psa
+                    JOIN PlanAssignmentItem pai ON psa.id = pai.assignment_id
+                    WHERE psa.plan_id = ?
+                    GROUP BY psa.session_id;
+                    """,
+                    (bal_plan_id,)
+                ).fetchall()
+            }
+
+            # Independently calculate slot-level difference
+            independent_diffs = sum(
+                1 for sid in safe_assignments
+                if sid in bal_assignments and bal_assignments[sid] != safe_assignments[sid]
+            )
+
+            # Assert that Balanced actually produced semantic differences relative to Safe
+            self.assertGreaterEqual(independent_diffs, 1, "Balanced plan must independently differ from Safe in at least 1 slot")
+            self.assertEqual(bal_plan_row["diversity_achieved"], independent_diffs, "Reported diversity_achieved must match independent calculation")
+            print(f"PASS: Invariant 78: Independent slot differences verified: {independent_diffs} diffs between Safe and Balanced")
 
     # 79. Feasible-substitute count excludes dirty, reserved and incompatible garments
     def test_79_feasible_substitute_count_excludes_ineligible_garments(self):
@@ -1272,14 +1304,15 @@ class TestP0P1Invariants(unittest.TestCase):
             db = Database(temp_db_path)
             db.migrate()
 
-            with db.transaction() as conn:
-                sim = LifecycleSmokeSimulator(conn, user_id="u_sim_80", db_file_path=temp_db_path)
-                result = sim.run_simulation(start_date="2026-03-01", days=3, strategy_mode=StrategyMode.SAFE)
+            conn = db.get_connection()
+            sim = LifecycleSmokeSimulator(conn, user_id="u_sim_80", db_file_path=temp_db_path)
+            result = sim.run_simulation(start_date="2026-03-01", days=3, strategy_mode=StrategyMode.SAFE)
 
-                self.assertIsInstance(result.foreign_keys_valid, bool)
-                self.assertIsInstance(result.domain_invariants_valid, bool)
-                self.assertTrue(result.foreign_keys_valid, "PRAGMA foreign_key_check must pass")
-                self.assertTrue(result.domain_invariants_valid, "Domain reconciliation invariants must pass")
+            self.assertIsInstance(result.foreign_keys_valid, bool)
+            self.assertIsInstance(result.domain_invariants_valid, bool)
+            self.assertIsInstance(result.basic_domain_consistency_valid, bool)
+            self.assertTrue(result.foreign_keys_valid, "PRAGMA foreign_key_check must pass")
+            self.assertTrue(result.basic_domain_consistency_valid, "Basic domain consistency invariants must pass")
         finally:
             db.close()
             for p in Path(temp_db_path).parent.glob(Path(temp_db_path).name + "*"):

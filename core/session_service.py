@@ -239,18 +239,8 @@ class SessionService:
 
         # Invalidate overlapping plans only if and where sessions were newly created
         if created_dates:
-            min_date = min(created_dates)
-            max_date = max(created_dates)
-            self.conn.execute(
-                """
-                UPDATE RecommendationPlan
-                SET status = 'SUPERSEDED',
-                    invalidation_reason = ?
-                WHERE user_id = ? AND status = 'PROPOSED'
-                  AND horizon_start_date <= ? AND horizon_end_date >= ?;
-                """,
-                (InvalidationReason.EVENT_ADDED_OR_MODIFIED.value, user_id, max_date, min_date),
-            )
+            for cdate in created_dates:
+                self._invalidate_overlapping_plans(user_id, cdate, InvalidationReason.EVENT_ADDED_OR_MODIFIED)
 
         return created_session_ids
 
@@ -278,14 +268,36 @@ class SessionService:
         session_date: str,
         reason: InvalidationReason,
     ) -> None:
-        """Invalidates proposed plans overlapping the added/modified session."""
-        self.conn.execute(
+        """Invalidates proposed plans overlapping the added/modified session and releases reservations."""
+        cur = self.conn.execute(
             """
-            UPDATE RecommendationPlan
-            SET status = 'SUPERSEDED',
-                invalidation_reason = ?
+            SELECT id FROM RecommendationPlan
             WHERE user_id = ? AND status = 'PROPOSED'
               AND horizon_start_date <= ? AND horizon_end_date >= ?;
             """,
-            (reason.value, user_id, session_date, session_date),
+            (user_id, session_date, session_date),
         )
+        plan_ids = [r["id"] for r in cur.fetchall()]
+        for pid in plan_ids:
+            self.conn.execute(
+                """
+                UPDATE RecommendationPlan
+                SET status = 'SUPERSEDED',
+                    invalidation_reason = ?
+                WHERE id = ?;
+                """,
+                (reason.value, pid),
+            )
+            self.conn.execute(
+                "DELETE FROM PlanWearAuthorizationReservation WHERE plan_id = ?;",
+                (pid,),
+            )
+
+    def skip_or_cancel_session(self, session_id: str, reason: str = "CANCELLED") -> None:
+        """
+        Scenario 25: Records a session as CANCELLED (satisfying schema CHECK) and atomically releases
+        any PlanWearAuthorizationReservation tied to this session.
+        """
+        self._require_transaction()
+        self.conn.execute("UPDATE WearSession SET status = 'CANCELLED' WHERE id = ?;", (session_id,))
+        self.conn.execute("DELETE FROM PlanWearAuthorizationReservation WHERE session_id = ?;", (session_id,))

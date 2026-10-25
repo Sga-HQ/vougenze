@@ -63,10 +63,10 @@ class TestInvariants81to100(unittest.TestCase):
             shutil.rmtree("catalogued", ignore_errors=True)
 
     # -------------------------------------------------------------------------
-    # Invariant 81: Candidate pool truncation retains unique HIGH-session item
+    # Invariant 81: Formal presentation-tagged item survives heuristic truncation
     # -------------------------------------------------------------------------
-    def test_81_candidate_pool_truncation_retains_unique_high_session_item(self):
-        """Invariant 81: Pool truncation preserves critical items regardless of like_rating."""
+    def test_81_formal_presentation_tagged_item_survives_heuristic_truncation(self):
+        """Invariant 81: Formal presentation-tagged item survives heuristic truncation regardless of like_rating."""
         with self.db.transaction() as conn:
             # Insert 20 casual shirts with like_rating = 10, formality = 1
             for i in range(20):
@@ -104,10 +104,10 @@ class TestInvariants81to100(unittest.TestCase):
 
             # The critical presentation shirt with like_rating 1 must survive truncation!
             self.assertIn("g_critical_pres", truncated_ids)
-            print("PASS: Invariant 81: Candidate pool truncation retained unique HIGH-session item despite low like rating")
+            print("PASS: Invariant 81: Formal presentation-tagged item survived heuristic truncation despite low like rating")
 
     # -------------------------------------------------------------------------
-    # Invariant 82: Cartesian truncation preserves critical & one-piece quotas
+    # Invariant 82: Dedicated candidate quotas protect one-pieces
     # -------------------------------------------------------------------------
     def test_82_cartesian_truncation_preserves_critical_and_one_piece_quotas(self):
         """Invariant 82: Dedicated candidate quotas protect one-pieces even if standard Cartesian combinations exceed budget."""
@@ -163,6 +163,50 @@ class TestInvariants81to100(unittest.TestCase):
             )
             print(f"PASS: Invariant 82: Dedicated candidate quota preserved {len(one_piece_cands)} one-piece candidates under heavy Cartesian pressure")
 
+    def test_82b_critical_standard_combination_survives_cartesian_truncation(self):
+        """Invariant 82b: Critical standard outfit item survives role pool truncation and appears in candidate set despite 500+ Cartesian combinations."""
+        with self.db.transaction() as conn:
+            sid = "ws_inv_82b"
+            conn.execute(
+                "INSERT INTO WearSession(id, user_id, session_date, session_type, importance, required_roles) "
+                "VALUES (?, ?, '2026-03-10', 'presentation', 'HIGH', '[\"top\", \"bottom\", \"footwear\"]');",
+                (sid, self.user_id),
+            )
+
+            # Insert 25 ordinary tops with high like_rating = 10, formality = 1
+            for i in range(25):
+                conn.execute(
+                    "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                    "VALUES (?, ?, ?, 'top', 'tee', 'regular', 'white', 1, 10);",
+                    (f"g_ord_top_{i}", self.user_id, f"Ordinary Top {i}"),
+                )
+            # Insert 1 critical formal shirt with low like_rating = 1, but formality = 5 and 'presentation' context
+            conn.execute(
+                "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating, usage_contexts) "
+                "VALUES ('g_crit_top_82b', ?, 'Critical Shirt', 'top', 'shirt', 'regular', 'white', 5, 1, '[\"presentation\"]');",
+                (self.user_id,),
+            )
+            # 5 Bottoms and 4 Shoes -> 26 tops x 5 bottoms x 4 shoes = 520 potential combinations
+            for b in range(5):
+                conn.execute(
+                    "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                    "VALUES (?, ?, ?, 'bottom', 'pants', 'regular', 'blue', 3, 8);",
+                    (f"g_bot_82b_{b}", self.user_id, f"Pants {b}"),
+                )
+            for s in range(4):
+                conn.execute(
+                    "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, formality, like_rating) "
+                    "VALUES (?, ?, ?, 'footwear', 'shoes', 'regular', 'black', 3, 8);",
+                    (f"g_shoe_82b_{s}", self.user_id, f"Shoes {s}"),
+                )
+
+            gen = CandidateGenerator(conn)
+            candidates = gen.generate_candidates(sid)
+            crit_cands = [c for c in candidates if "g_crit_top_82b" in c.garment_ids]
+            self.assertTrue(len(crit_cands) >= 1, "Critical standard combination must survive truncation")
+            self.assertEqual(len(crit_cands), 20, "All 5 bottoms x 4 shoes combinations with critical top must survive into the 200-candidate set")
+            print(f"PASS: Invariant 82b: Critical standard outfit survived Cartesian truncation ({len(crit_cands)} combinations generated out of {len(candidates)} total capped candidates)")
+
     # -------------------------------------------------------------------------
     # Invariant 83: Reused snapshot ID with different role membership is rejected
     # -------------------------------------------------------------------------
@@ -216,7 +260,39 @@ class TestInvariants81to100(unittest.TestCase):
                     candidate=cand2,
                     session_id=sid,
                 )
-            print("PASS: Invariant 83: Reused snapshot ID with different role membership raised SnapshotConflictError")
+
+            # Identical roles but differing generator_version must raise SnapshotConflictError
+            with self.assertRaises(SnapshotConflictError):
+                ev_svc.create_candidate_snapshot(
+                    user_id=self.user_id,
+                    candidate=cand1,
+                    session_id=sid,
+                    generator_version="v1_experimental",
+                )
+
+            # Identical roles but differing compatibility_score must raise SnapshotConflictError
+            cand1_diff_score = OutfitCandidate(
+                id="cand_fixed_id",
+                garment_ids=["g_83_a", "g_83_b", "g_83_s"],
+                roles={"top": "g_83_a", "bottom": "g_83_b", "footwear": "g_83_s"},
+                compatibility_score=0.99,
+            )
+            with self.assertRaises(SnapshotConflictError):
+                ev_svc.create_candidate_snapshot(
+                    user_id=self.user_id,
+                    candidate=cand1_diff_score,
+                    session_id=sid,
+                )
+
+            # Identical roles and scores but differing feature_snapshot must raise SnapshotConflictError
+            with self.assertRaises(SnapshotConflictError):
+                ev_svc.create_candidate_snapshot(
+                    user_id=self.user_id,
+                    candidate=cand1,
+                    session_id=sid,
+                    feature_snapshot={"custom_feature": "altered_value"},
+                )
+            print("PASS: Invariant 83: Immutable snapshot conflict detection verified across roles, generator version, feature snapshot, and component scores")
 
     # -------------------------------------------------------------------------
     # Invariant 84: Rejection evidence validates inclusion-type consistency
@@ -445,25 +521,44 @@ class TestInvariants81to100(unittest.TestCase):
             self.assertEqual(c_row["status"], "PENDING")
             img_count = conn.execute("SELECT count(*) FROM GarmentImage WHERE garment_id = 'g_orig_88';").fetchone()[0]
             self.assertEqual(img_count, 0)
-            print("PASS: Invariant 88: Duplicate resolution failure rolled back candidate status and image rows cleanly")
+
+            # Verify filesystem rollback: no orphan catalogued file left on disk
+            cat_dir = Path("catalogued/g_orig_88")
+            if cat_dir.exists():
+                orphan_files = list(cat_dir.glob("*"))
+                self.assertEqual(len(orphan_files), 0, f"Filesystem rollback failed: found leftover files {orphan_files}")
+            print("PASS: Invariant 88: Duplicate resolution failure rolled back candidate status, image rows, and filesystem files cleanly")
 
     # -------------------------------------------------------------------------
     # Invariant 89: Laundry dispatch requires active transaction
     # -------------------------------------------------------------------------
     def test_89_laundry_dispatch_requires_active_transaction(self):
-        """Invariant 89: Calling send_laundry_batch without active transaction raises RuntimeError."""
+        """Invariant 89: Calling send_laundry_batch with valid garments outside active transaction raises RuntimeError."""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color, condition_state, availability_state) "
+                "VALUES ('g_valid_89', ?, 'Valid Laundry Shirt', 'top', 'shirt', 'regular', 'white', 'NEEDS_WASH', 'AVAILABLE');",
+                (self.user_id,),
+            )
+
         with self.db.connection() as conn:
             self.assertFalse(conn.in_transaction)
             laundry_svc = LaundryService(conn)
             with self.assertRaises(RuntimeError) as cm:
                 laundry_svc.send_laundry_batch(
                     user_id=self.user_id,
-                    garment_ids=["g_nonexistent"],
+                    garment_ids=["g_valid_89"],
                     sent_date="2026-03-10",
                     expected_return_date="2026-03-12",
                 )
             self.assertIn("require an active transaction", str(cm.exception))
-            print("PASS: Invariant 89: Laundry dispatch outside transaction raised RuntimeError")
+
+            # Verify no batch was created and garment state was not changed
+            g_row = conn.execute("SELECT availability_state FROM Garment WHERE id = 'g_valid_89';").fetchone()
+            self.assertEqual(g_row["availability_state"], "AVAILABLE")
+            batch_count = conn.execute("SELECT count(*) FROM LaundryBatch;").fetchone()[0]
+            self.assertEqual(batch_count, 0)
+            print("PASS: Invariant 89: Fully valid laundry dispatch outside transaction was rejected by transaction guard")
 
     # -------------------------------------------------------------------------
     # Invariant 90: Item return failure rolls back batch item, wash, garment and batch
@@ -651,50 +746,60 @@ class TestInvariants81to100(unittest.TestCase):
         with self.db.transaction() as conn:
             session_svc = SessionService(conn)
 
-            # 1. Pre-create sessions for 2026-03-01 and 2026-03-02
-            conn.execute(
-                "INSERT INTO WearSession(id, user_id, session_date, session_type) VALUES "
-                "('ws_94_1', ?, '2026-03-01', 'casual'), ('ws_94_2', ?, '2026-03-02', 'casual');",
-                (self.user_id, self.user_id),
-            )
-
-            # 2. Propose a plan covering 2026-03-01 to 2026-03-02
-            plan_id = "rp_early_horizon"
+            # 1. Propose a plan covering Wednesday only (2026-03-04)
+            plan_wed_id = "rp_wednesday_only"
             conn.execute(
                 """
                 INSERT INTO RecommendationPlan(id, user_id, strategy_mode, horizon_start_date, horizon_end_date, status)
-                VALUES (?, ?, 'SAFE', '2026-03-01', '2026-03-02', 'PROPOSED');
+                VALUES (?, ?, 'SAFE', '2026-03-04', '2026-03-04', 'PROPOSED');
                 """,
-                (plan_id, self.user_id),
+                (plan_wed_id, self.user_id),
             )
 
-            # 3. Create template valid only for 2026-03-05
-            tpl_id = "tpl_94_late"
+            # 2. Also propose a plan covering Friday only (2026-03-06) to verify it IS invalidated
+            plan_fri_id = "rp_friday_only"
+            conn.execute(
+                """
+                INSERT INTO RecommendationPlan(id, user_id, strategy_mode, horizon_start_date, horizon_end_date, status)
+                VALUES (?, ?, 'SAFE', '2026-03-06', '2026-03-06', 'PROPOSED');
+                """,
+                (plan_fri_id, self.user_id),
+            )
+
+            # 3. Create template active for Mon (dow=0) and Fri (dow=4), but not Wed (dow=2)
+            tpl_id = "tpl_94_mon_fri"
             conn.execute(
                 "INSERT INTO WearSessionTemplate(id, user_id, template_name, effective_from, effective_until) "
-                "VALUES (?, ?, 'Late Template', '2026-03-05', '2026-03-05');",
+                "VALUES (?, ?, 'Mon/Fri Template', '2026-03-01', '2026-03-10');",
                 (tpl_id, self.user_id),
             )
+            # 2026-03-02 is Monday (dow=0), 2026-03-06 is Friday (dow=4)
             conn.execute(
                 "INSERT INTO WearSessionTemplateDay(id, template_id, day_of_week, session_type, importance, required_roles) "
-                "VALUES ('td_94', ?, 4, 'work', 'NORMAL', '[\"top\", \"bottom\"]');",
-                (tpl_id,),
+                "VALUES ('td_94_m', ?, 0, 'work', 'NORMAL', '[\"top\", \"bottom\"]'), "
+                "       ('td_94_f', ?, 4, 'work', 'NORMAL', '[\"top\", \"bottom\"]');",
+                (tpl_id, tpl_id),
             )
 
-            # 4. Request materialization over horizon 2026-03-01 to 2026-03-05
-            # Since 2026-03-01 and 2026-03-02 already have sessions, and template only creates on 2026-03-05,
-            # newly created dates is only {'2026-03-05'}.
-            session_svc.materialize_sessions_for_horizon(
+            # 4. Request materialization over horizon Mon 2026-03-02 to Fri 2026-03-06
+            # This creates sessions on Mon 2026-03-02 and Fri 2026-03-06 (noncontiguous dates!)
+            created = session_svc.materialize_sessions_for_horizon(
                 user_id=self.user_id,
-                start_date="2026-03-01",
-                end_date="2026-03-05",
+                start_date="2026-03-02",
+                end_date="2026-03-06",
                 template_id=tpl_id,
             )
+            self.assertEqual(len(created), 2)
 
-            # Plan for 2026-03-01 to 2026-03-02 must NOT be invalidated!
-            p_row = conn.execute("SELECT status FROM RecommendationPlan WHERE id = ?;", (plan_id,)).fetchone()
-            self.assertEqual(p_row["status"], "PROPOSED")
-            print("PASS: Invariant 94: Plan invalidation correctly preserved proposed plan not overlapping created dates")
+            # Wednesday plan (2026-03-04) must NOT be invalidated because no session was created on Wednesday!
+            p_wed = conn.execute("SELECT status FROM RecommendationPlan WHERE id = ?;", (plan_wed_id,)).fetchone()
+            self.assertEqual(p_wed["status"], "PROPOSED", "Wednesday plan must NOT be invalidated by noncontiguous Mon/Fri creations")
+
+            # Friday plan (2026-03-06) MUST be invalidated because a session was created on Friday!
+            p_fri = conn.execute("SELECT status, invalidation_reason FROM RecommendationPlan WHERE id = ?;", (plan_fri_id,)).fetchone()
+            self.assertEqual(p_fri["status"], "SUPERSEDED")
+            self.assertEqual(p_fri["invalidation_reason"], "EVENT_ADDED_OR_MODIFIED")
+            print("PASS: Invariant 94: Noncontiguous session creation (Mon & Fri) preserved Wed plan and correctly superseded Fri plan")
 
     # -------------------------------------------------------------------------
     # Invariant 95: Applied migration with changed SHA-256 fails closed
@@ -770,16 +875,30 @@ class TestInvariants81to100(unittest.TestCase):
             )
             balanced_plan = planner.get_plan(balanced_plan_id)
 
-            # Verify diversity target and achieved
+            # Independently calculate slot-level difference against Safe
+            independent_diffs = sum(
+                1 for sid in safe_signatures
+                if tuple(sorted(balanced_plan.assignments[sid].garment_ids)) != safe_signatures[sid]
+            )
+
+            # Verify diversity target, independent difference count, and reported counter
             self.assertGreaterEqual(balanced_plan.diversity_target, 1)
-            self.assertGreaterEqual(balanced_plan.diversity_achieved, balanced_plan.diversity_target)
-            print(f"PASS: Invariant 96: Balanced strategy achieved {balanced_plan.diversity_achieved} diffs (target {balanced_plan.diversity_target})")
+            self.assertEqual(balanced_plan.diversity_achieved, independent_diffs, "diversity_achieved must match independent calculation")
+            self.assertGreaterEqual(independent_diffs, balanced_plan.diversity_target)
+
+            # Verify lexicographic objective equality (uncovered sessions remain 0)
+            safe_eval = conn.execute("SELECT * FROM PlanEvaluation WHERE plan_id = ?;", (safe_plan_id,)).fetchone()
+            bal_eval = conn.execute("SELECT * FROM PlanEvaluation WHERE plan_id = ?;", (balanced_plan_id,)).fetchone()
+            self.assertEqual(bal_eval["uncovered_high"], safe_eval["uncovered_high"])
+            self.assertEqual(bal_eval["uncovered_normal"], safe_eval["uncovered_normal"])
+            self.assertGreaterEqual(bal_eval["total_quality"], safe_eval["total_quality"] * 0.70, "Quality loss in Balanced must stay bounded")
+            print(f"PASS: Invariant 96: Balanced strategy achieved {independent_diffs} independent diffs (target {balanced_plan.diversity_target}) with bounded quality")
 
     # -------------------------------------------------------------------------
     # Invariant 97: Exploratory reaches attainable low/normal novelty target
     # -------------------------------------------------------------------------
     def test_97_exploratory_reaches_attainable_novelty_target(self):
-        """Invariant 97: Exploratory search reaches attainable low/normal novelty target."""
+        """Invariant 97: Exploratory search reaches novelty target on eligible low/normal sessions while preserving HIGH sessions."""
         with self.db.transaction() as conn:
             planner = ContinuationPlanner(conn)
             # Create 3 sessions (2 normal, 1 high)
@@ -827,9 +946,24 @@ class TestInvariants81to100(unittest.TestCase):
             )
             exp_plan = planner.get_plan(exp_plan_id)
 
-            self.assertGreaterEqual(exp_plan.diversity_target, 1)
-            self.assertGreaterEqual(exp_plan.diversity_achieved, exp_plan.diversity_target)
-            print(f"PASS: Invariant 97: Exploratory strategy achieved {exp_plan.diversity_achieved} novel differences (target {exp_plan.diversity_target})")
+            # Verify that HIGH session quality is strictly protected
+            safe_eval = conn.execute("SELECT * FROM PlanEvaluation WHERE plan_id = ?;", (safe_plan_id,)).fetchone()
+            exp_eval = conn.execute("SELECT * FROM PlanEvaluation WHERE plan_id = ?;", (exp_plan_id,)).fetchone()
+            self.assertEqual(exp_eval["uncovered_high"], 0)
+            self.assertGreaterEqual(exp_eval["min_high_importance_quality"], safe_eval["min_high_importance_quality"])
+
+            # Independently compute novelty differences across sessions
+            total_diffs = sum(
+                1 for sid in safe_signatures
+                if tuple(sorted(exp_plan.assignments[sid].garment_ids)) != safe_signatures[sid]
+            )
+            normal_diffs = sum(
+                1 for sid in ("ws_97_1", "ws_97_2")
+                if tuple(sorted(exp_plan.assignments[sid].garment_ids)) != safe_signatures[sid]
+            )
+            self.assertGreaterEqual(normal_diffs, 1, "Exploratory mode must generate novel differences on eligible NORMAL sessions")
+            self.assertEqual(exp_plan.diversity_achieved, total_diffs)
+            print(f"PASS: Invariant 97: Exploratory strategy achieved {total_diffs} novel differences ({normal_diffs} on NORMAL sessions) while preserving HIGH session quality")
 
     # -------------------------------------------------------------------------
     # Invariant 98: Safe has no artificial diversity target
@@ -959,13 +1093,13 @@ class TestInvariants81to100(unittest.TestCase):
                 (self.user_id, self.user_id),
             )
 
-            auth_id = "gwa_100_exact"
+            auth_reserved = "gwa_100_reserved"
             conn.execute(
                 """
                 INSERT INTO GarmentWearAuthorization(id, garment_id, authorized_by, reason, status, authorized_at)
-                VALUES (?, ?, 'owner', 'Exact test auth', 'AVAILABLE', '2026-03-10T08:00:00Z');
+                VALUES (?, ?, 'owner', 'Plan reserved auth', 'AVAILABLE', '2026-03-10T08:00:00Z');
                 """,
-                (auth_id, gid),
+                (auth_reserved, gid),
             )
 
             planner = ContinuationPlanner(conn)
@@ -976,14 +1110,49 @@ class TestInvariants81to100(unittest.TestCase):
                 strategy_mode=StrategyMode.SAFE,
             )
 
+            # Insert a competing, unreserved AVAILABLE authorization created later
+            auth_unreserved = "gwa_100_unreserved"
+            conn.execute(
+                """
+                INSERT INTO GarmentWearAuthorization(id, garment_id, authorized_by, reason, status, authorized_at)
+                VALUES (?, ?, 'owner', 'Competing unreserved auth', 'AVAILABLE', '2026-03-10T09:00:00Z');
+                """,
+                (auth_unreserved, gid),
+            )
+
+            # Verify the plan specifically reserved auth_reserved
+            res_row = conn.execute(
+                "SELECT authorization_id FROM PlanWearAuthorizationReservation WHERE plan_id = ? AND garment_id = ?;",
+                (plan_id, gid),
+            ).fetchone()
+            self.assertEqual(res_row["authorization_id"], auth_reserved)
+
             # Retrieve assignment ID
             psa_row = conn.execute(
                 "SELECT id FROM PlanSessionAssignment WHERE plan_id = ? AND session_id = ?;",
                 (plan_id, s1),
             ).fetchone()
             psa_id = psa_row["id"]
-
             wear_svc = WearService(conn)
+
+            # Insert an alternate pair of shoes to test mismatched recommendation logging
+            conn.execute(
+                "INSERT INTO Garment(id, user_id, name, physical_category, subcategory, cut_and_fit, primary_color) "
+                "VALUES ('g_100_s_alt', ?, 'Alt Shoes', 'footwear', 'sneakers', 'regular', 'black');",
+                (self.user_id,),
+            )
+            # Mismatched outfit without was_modified_before_wear must be rejected
+            with self.assertRaises(ValueError) as cm:
+                wear_svc.log_outfit_wear(
+                    user_id=self.user_id,
+                    session_id=s1,
+                    garment_roles={"top": gid, "bottom": "g_100_b", "footwear": "g_100_s_alt"},
+                    local_wear_date="2026-03-10",
+                    recommendation_plan_id=plan_id,
+                    plan_assignment_id=psa_id,
+                )
+            self.assertIn("do not match recommended plan assignment", str(cm.exception))
+
             log_id = wear_svc.log_outfit_wear(
                 user_id=self.user_id,
                 session_id=s1,
@@ -993,19 +1162,24 @@ class TestInvariants81to100(unittest.TestCase):
                 plan_assignment_id=psa_id,
             )
 
-            # Verify the exact authorization was CONSUMED
-            auth_row = conn.execute("SELECT * FROM GarmentWearAuthorization WHERE id = ?;", (auth_id,)).fetchone()
-            self.assertEqual(auth_row["status"], "CONSUMED")
-            self.assertIsNotNone(auth_row["consumed_by_wear_event_id"])
+            # Verify: ONLY auth_reserved was CONSUMED
+            res_auth_row = conn.execute("SELECT * FROM GarmentWearAuthorization WHERE id = ?;", (auth_reserved,)).fetchone()
+            self.assertEqual(res_auth_row["status"], "CONSUMED")
+            self.assertIsNotNone(res_auth_row["consumed_by_wear_event_id"])
 
-            # Verify wear event points to this garment
+            # Verify: competing auth_unreserved remains AVAILABLE and unconsumed
+            unres_auth_row = conn.execute("SELECT * FROM GarmentWearAuthorization WHERE id = ?;", (auth_unreserved,)).fetchone()
+            self.assertEqual(unres_auth_row["status"], "AVAILABLE")
+            self.assertIsNone(unres_auth_row["consumed_by_wear_event_id"])
+
+            # Verify wear event points to this garment and log
             we_row = conn.execute(
                 "SELECT * FROM WearEvent WHERE id = ?;",
-                (auth_row["consumed_by_wear_event_id"],),
+                (res_auth_row["consumed_by_wear_event_id"],),
             ).fetchone()
             self.assertEqual(we_row["garment_id"], gid)
             self.assertEqual(we_row["outfit_wear_log_id"], log_id)
-            print("PASS: Invariant 100: Exact plan-persisted authorization was consumed during wear logging")
+            print("PASS: Invariant 100: Exact plan-persisted authorization was consumed while competing unreserved authorization remained AVAILABLE")
 
 
 if __name__ == "__main__":

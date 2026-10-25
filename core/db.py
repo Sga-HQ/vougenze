@@ -34,6 +34,14 @@ def split_sql_statements(sql: str) -> List[str]:
     return statements
 
 
+_ROLLBACK_CALLBACKS: Dict[int, List[Any]] = {}
+
+
+def register_rollback_callback(conn: sqlite3.Connection, callback: Any) -> None:
+    """Registers a callback to execute if the active transaction on conn rolls back."""
+    _ROLLBACK_CALLBACKS.setdefault(id(conn), []).append(callback)
+
+
 class Database:
     """Manages SQLite connections, foreign keys enforcement, and transactional boundaries."""
 
@@ -101,14 +109,24 @@ class Database:
         conn = self.get_connection()
         if conn.in_transaction:
             raise RuntimeError("Nested transaction attempted without savepoint support")
+        conn_id = id(conn)
+        _ROLLBACK_CALLBACKS[conn_id] = []
         conn.execute("BEGIN IMMEDIATE;")
         try:
             yield conn
             conn.execute("COMMIT;")
+            _ROLLBACK_CALLBACKS.pop(conn_id, None)
         except Exception:
             conn.execute("ROLLBACK;")
+            callbacks = _ROLLBACK_CALLBACKS.pop(conn_id, [])
+            for cb in callbacks:
+                try:
+                    cb()
+                except Exception:
+                    pass
             raise
         finally:
+            _ROLLBACK_CALLBACKS.pop(conn_id, None)
             if not self._is_memory:
                 conn.close()
 

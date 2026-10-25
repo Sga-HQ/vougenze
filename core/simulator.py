@@ -44,6 +44,7 @@ class SimulationResult:
     db_size_bytes: int
     foreign_keys_valid: bool
     domain_invariants_valid: bool
+    basic_domain_consistency_valid: bool
     invariants_passed: bool
     summary_notes: str
 
@@ -63,16 +64,38 @@ class LifecycleSmokeSimulator:
         self.planner = ContinuationPlanner(conn)
         self.evidence_service = PreferenceEvidenceService(conn)
 
+    def _tx(self):
+        """Context manager guaranteeing an active transaction for multi-write operations."""
+        class _TxContext:
+            def __init__(self, conn: sqlite3.Connection):
+                self.conn = conn
+                self._managed = False
+
+            def __enter__(self):
+                if not self.conn.in_transaction:
+                    self.conn.execute("BEGIN IMMEDIATE;")
+                    self._managed = True
+                return self.conn
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if self._managed:
+                    if exc_type is not None:
+                        self.conn.execute("ROLLBACK;")
+                    else:
+                        self.conn.execute("COMMIT;")
+        return _TxContext(self.conn)
+
     def seed_initial_wardrobe(self) -> None:
         """Seeds a diverse capsule wardrobe with varied categories, formalities, and wear limits."""
-        # Ensure user exists
-        self.conn.execute(
-            """
-            INSERT OR IGNORE INTO User(id, display_name, timezone_id, active_history_window)
-            VALUES (?, 'Simulator User', 'UTC', 100);
-            """,
-            (self.user_id,),
-        )
+        with self._tx():
+            # Ensure user exists
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO User(id, display_name, timezone_id, active_history_window)
+                VALUES (?, 'Simulator User', 'UTC', 100);
+                """,
+                (self.user_id,),
+            )
 
         # Weekly laundry policy: laundry sent on Sundays (weekday 6), expected Tuesday (weekday 1)
         self.laundry_service.create_policy(
@@ -177,11 +200,12 @@ class LifecycleSmokeSimulator:
             weekday = cur_date.weekday()  # 0=Monday, 6=Sunday
 
             # 1. Materialize routine sessions for today
-            mat_ids = self.session_service.materialize_sessions_for_horizon(
-                user_id=self.user_id,
-                start_date=date_str,
-                end_date=date_str,
-            )
+            with self._tx():
+                mat_ids = self.session_service.materialize_sessions_for_horizon(
+                    user_id=self.user_id,
+                    start_date=date_str,
+                    end_date=date_str,
+                )
             sessions_materialized += len(mat_ids)
 
             # 2. Check Laundry Cycle
@@ -198,12 +222,13 @@ class LifecycleSmokeSimulator:
                 if dirty_garments:
                     batch_gids = [r["id"] for r in dirty_garments]
                     ret_date = (cur_date + timedelta(days=2)).strftime("%Y-%m-%d")
-                    active_laundry_batch_id = self.laundry_service.send_laundry_batch(
-                        user_id=self.user_id,
-                        garment_ids=batch_gids,
-                        sent_date=date_str,
-                        expected_return_date=ret_date,
-                    )
+                    with self._tx():
+                        active_laundry_batch_id = self.laundry_service.send_laundry_batch(
+                            user_id=self.user_id,
+                            garment_ids=batch_gids,
+                            sent_date=date_str,
+                            expected_return_date=ret_date,
+                        )
                     laundry_return_date = ret_date
                     laundry_batches_processed += 1
 
@@ -215,13 +240,14 @@ class LifecycleSmokeSimulator:
                     (active_laundry_batch_id,),
                 ).fetchall()
                 for r in batch_items:
-                    self.laundry_service.record_item_return(
-                        batch_id=active_laundry_batch_id,
-                        garment_id=r["garment_id"],
-                        item_status=LaundryItemStatus.RETURNED_CLEAN,
-                        wash_confirmed=True,
-                        return_date=f"{date_str}T10:00:00Z",
-                    )
+                    with self._tx():
+                        self.laundry_service.record_item_return(
+                            batch_id=active_laundry_batch_id,
+                            garment_id=r["garment_id"],
+                            item_status=LaundryItemStatus.RETURNED_CLEAN,
+                            wash_confirmed=True,
+                            return_date=f"{date_str}T10:00:00Z",
+                        )
                 active_laundry_batch_id = None
                 laundry_return_date = None
 
@@ -237,12 +263,13 @@ class LifecycleSmokeSimulator:
             if day_sessions:
                 # Run continuation planner for horizon (today to today + 3 days)
                 horizon_end = (cur_date + timedelta(days=3)).strftime("%Y-%m-%d")
-                pid = self.planner.generate_plan(
-                    user_id=self.user_id,
-                    horizon_start_date=date_str,
-                    horizon_end_date=horizon_end,
-                    strategy_mode=strategy_mode,
-                )
+                with self._tx():
+                    pid = self.planner.generate_plan(
+                        user_id=self.user_id,
+                        horizon_start_date=date_str,
+                        horizon_end_date=horizon_end,
+                        strategy_mode=strategy_mode,
+                    )
 
                 for session in day_sessions:
                     sid = session["id"]
@@ -267,59 +294,60 @@ class LifecycleSmokeSimulator:
                             quality_score=assign["quality_score"] or 0.8,
                         )
 
-                        # Capture preference evidence
-                        self.evidence_service.record_selection_evidence(
-                            user_id=self.user_id,
-                            session_id=sid,
-                            occasion_context=session["session_type"],
-                            selected_candidate=cand,
-                            alternatives=[],
-                            selection_reason=["planned_continuation_optimal"],
-                        )
-                        evidence_count += 1
+                        with self._tx():
+                            # Capture preference evidence
+                            self.evidence_service.record_selection_evidence(
+                                user_id=self.user_id,
+                                session_id=sid,
+                                occasion_context=session["session_type"],
+                                selected_candidate=cand,
+                                alternatives=[],
+                                selection_reason=["planned_continuation_optimal"],
+                            )
+                            evidence_count += 1
 
-                        # Commit wear log
-                        self.wear_service.log_outfit_wear(
-                            user_id=self.user_id,
-                            session_id=sid,
-                            garment_roles=roles_map,
-                            source="recommended_selected",
-                            session_type=session["session_type"],
-                            importance=session["importance"],
-                            local_wear_date=date_str,
-                            timezone_id="UTC",
-                            recommendation_plan_id=pid,
-                            plan_assignment_id=assign["id"],
-                            was_recommended=1,
-                            satisfaction_rating=8,
-                        )
-                        wears_logged += 1
+                            # Commit wear log
+                            self.wear_service.log_outfit_wear(
+                                user_id=self.user_id,
+                                session_id=sid,
+                                garment_roles=roles_map,
+                                source="recommended_selected",
+                                session_type=session["session_type"],
+                                importance=session["importance"],
+                                local_wear_date=date_str,
+                                timezone_id="UTC",
+                                recommendation_plan_id=pid,
+                                plan_assignment_id=assign["id"],
+                                was_recommended=1,
+                                satisfaction_rating=8,
+                            )
+                            wears_logged += 1
 
-                        # Post-wear assessment (once per unique garment)
-                        for gid in dict.fromkeys(assigned_garments):
-                            grow = self.conn.execute(
-                                "SELECT wears_since_confirmed_wash, hard_limit_wears FROM Garment WHERE id = ?;",
-                                (gid,),
-                            ).fetchone()
-                            we_row = self.conn.execute(
-                                "SELECT id FROM WearEvent WHERE session_id = ? AND garment_id = ?;",
-                                (sid, gid),
-                            ).fetchone()
+                            # Post-wear assessment (once per unique garment)
+                            for gid in dict.fromkeys(assigned_garments):
+                                grow = self.conn.execute(
+                                    "SELECT wears_since_confirmed_wash, hard_limit_wears FROM Garment WHERE id = ?;",
+                                    (gid,),
+                                ).fetchone()
+                                we_row = self.conn.execute(
+                                    "SELECT id FROM WearEvent WHERE session_id = ? AND garment_id = ?;",
+                                    (sid, gid),
+                                ).fetchone()
 
-                            if we_row:
-                                limit = grow["hard_limit_wears"] or 2
-                                if grow["wears_since_confirmed_wash"] >= limit:
-                                    choice = PostWearChoice.NEEDS_WASH
-                                else:
-                                    choice = PostWearChoice.READY_TO_REUSE
+                                if we_row:
+                                    limit = grow["hard_limit_wears"] or 2
+                                    if grow["wears_since_confirmed_wash"] >= limit:
+                                        choice = PostWearChoice.NEEDS_WASH
+                                    else:
+                                        choice = PostWearChoice.READY_TO_REUSE
 
-                                self.state_engine.record_post_wear_assessment(
-                                    wear_event_id=we_row["id"],
-                                    garment_id=gid,
-                                    choice=choice,
-                                    notes=f"Simulated day {day_offset} review",
-                                    assessed_at=f"{date_str}T22:00:00Z",
-                                )
+                                    self.state_engine.record_post_wear_assessment(
+                                        wear_event_id=we_row["id"],
+                                        garment_id=gid,
+                                        choice=choice,
+                                        notes=f"Simulated day {day_offset} review",
+                                        assessed_at=f"{date_str}T22:00:00Z",
+                                    )
 
             # Advance to next civil calendar day
             cur_date += timedelta(days=1)
@@ -328,7 +356,7 @@ class LifecycleSmokeSimulator:
         fk_violations = self.conn.execute("PRAGMA foreign_key_check;").fetchall()
         foreign_keys_valid = len(fk_violations) == 0
 
-        # Domain invariants check
+        # Basic domain consistency check
         integrity_check = self.conn.execute("PRAGMA integrity_check;").fetchone()[0]
         orphan_in_laundry = self.conn.execute(
             """
@@ -336,8 +364,9 @@ class LifecycleSmokeSimulator:
             WHERE availability_state = 'IN_LAUNDRY' AND current_laundry_batch_id IS NULL;
             """
         ).fetchone()[0]
-        domain_invariants_valid = (integrity_check == "ok" and orphan_in_laundry == 0)
-        invariants_passed = foreign_keys_valid and domain_invariants_valid
+        basic_domain_consistency_valid = (integrity_check == "ok" and orphan_in_laundry == 0)
+        domain_invariants_valid = basic_domain_consistency_valid
+        invariants_passed = foreign_keys_valid and basic_domain_consistency_valid
 
         # 5. Measure storage economics (Spec 1.4)
         db_size = 0
@@ -367,6 +396,7 @@ class LifecycleSmokeSimulator:
             db_size_bytes=db_size,
             foreign_keys_valid=foreign_keys_valid,
             domain_invariants_valid=domain_invariants_valid,
+            basic_domain_consistency_valid=basic_domain_consistency_valid,
             invariants_passed=invariants_passed,
             summary_notes=summary,
         )

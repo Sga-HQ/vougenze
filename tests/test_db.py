@@ -91,6 +91,14 @@ class TestDatabase(unittest.TestCase):
             # Execute the invariant test script
             conn.executescript(sql_content)
 
+            # Mechanically verify every check recorded in _schema_test_results passed
+            results = conn.execute("SELECT test_id, test_output, passed FROM _schema_test_results;").fetchall()
+            self.assertTrue(len(results) >= 15, f"Expected at least 15 schema invariant checks, got {len(results)}")
+            for r in results:
+                tid, msg, passed = r[0], r[1], r[2]
+                self.assertEqual(passed, 1, f"Schema invariant {tid} failed: {msg}")
+                self.assertNotIn("FAILED", msg, f"Schema invariant {tid} failed: {msg}")
+
             # Check that foreign keys are still valid
             fk_violations = conn.execute("PRAGMA foreign_key_check;").fetchall()
             self.assertEqual(len(fk_violations), 0, f"Foreign key violations found: {fk_violations}")

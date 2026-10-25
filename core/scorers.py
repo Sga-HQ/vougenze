@@ -237,7 +237,7 @@ class DeterministicScorer:
                         else:
                             recency = 0.1
 
-                        prev_type = sim["session_type"]
+                        prev_type = sim.get("session_type", session_type)
                         if prev_type == session_type:
                             cf = 1.0
                         elif prev_type in ("home_casual", "sleepwear") and session_type in ("party", "presentation", "office"):

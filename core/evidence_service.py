@@ -94,9 +94,43 @@ class PreferenceEvidenceService:
         ).fetchone()
 
         if existing:
-            # Mechanically verify content equality
+            # Mechanically verify comprehensive content equality
             if existing["user_id"] != user_id or existing["session_id"] != session_id:
                 raise SnapshotConflictError(f"Snapshot ID collision for candidate '{cand_id}' with mismatched identity")
+
+            if existing["generator_version"] != generator_version:
+                raise SnapshotConflictError(
+                    f"Snapshot ID collision for candidate '{cand_id}' with mismatched generator_version: {existing['generator_version']} vs {generator_version}"
+                )
+
+            if existing["feature_schema_version"] != feature_schema_version:
+                raise SnapshotConflictError(
+                    f"Snapshot ID collision for candidate '{cand_id}' with mismatched feature_schema_version: {existing['feature_schema_version']} vs {feature_schema_version}"
+                )
+
+            for score_col, cand_val in [
+                ("compatibility_score", candidate.compatibility_score),
+                ("occasion_score", candidate.occasion_score),
+                ("preference_score", candidate.preference_score),
+                ("repetition_penalty", candidate.repetition_penalty),
+            ]:
+                if abs((existing[score_col] or 0.0) - (cand_val or 0.0)) > 1e-4:
+                    raise SnapshotConflictError(
+                        f"Snapshot ID collision for candidate '{cand_id}' with mismatched {score_col}: {existing[score_col]} vs {cand_val}"
+                    )
+
+            # Compare feature_snapshot payload
+            existing_feat_str = existing["feature_snapshot"]
+            incoming_feat_dict = feature_snapshot if feature_snapshot is not None else {"roles": candidate.roles, "is_fallback": candidate.is_fallback}
+            try:
+                existing_feat_dict = json.loads(existing_feat_str) if existing_feat_str else {}
+                if existing_feat_dict != incoming_feat_dict:
+                    raise SnapshotConflictError(
+                        f"Snapshot ID collision for candidate '{cand_id}' with mismatched feature_snapshot: {existing_feat_dict} vs {incoming_feat_dict}"
+                    )
+            except (json.JSONDecodeError, TypeError):
+                if existing_feat_str != json.dumps(incoming_feat_dict):
+                    raise SnapshotConflictError(f"Snapshot ID collision for candidate '{cand_id}' with mismatched raw feature_snapshot")
 
             items = self.conn.execute(
                 "SELECT outfit_role, garment_id FROM OutfitCandidateSnapshotItem WHERE candidate_id = ? ORDER BY outfit_role;",
@@ -422,3 +456,31 @@ class PreferenceEvidenceService:
             self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp_id};")
             self.conn.execute(f"RELEASE SAVEPOINT {sp_id};")
             raise
+
+    def record_skipped_evidence(
+        self,
+        user_id: str,
+        session_id: str,
+        occasion_context: str,
+        skipped_candidate: OutfitCandidate,
+        skip_reason: str = "SESSION_SKIPPED",
+        recorded_at: Optional[str] = None,
+    ) -> str:
+        """
+        Scenario 25: Records non-penalizing skipped/not-worn evidence distinguishing it from negative rejection.
+        """
+        now = recorded_at or self._utc_now()
+        evidence_id = f"pe_{uuid.uuid4().hex[:12]}"
+        cand_id = self.create_candidate_snapshot(user_id=user_id, candidate=skipped_candidate, session_id=session_id)
+        flags = {"skip_reason": skip_reason, "non_penalizing": 1}
+        self.conn.execute(
+            """
+            INSERT INTO PreferenceEvidence(
+                id, user_id, evidence_type, session_id, occasion_context,
+                rejected_candidate_id, rejection_reason, constraint_flags, recorded_at
+            )
+            VALUES (?, ?, 'skipped', ?, ?, ?, ?, ?, ?);
+            """,
+            (evidence_id, user_id, session_id, occasion_context, cand_id, skip_reason, json.dumps(flags), now),
+        )
+        return evidence_id

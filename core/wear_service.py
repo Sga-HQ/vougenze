@@ -136,6 +136,18 @@ class WearService:
             if recommendation_plan_id and pa["plan_id"] != recommendation_plan_id:
                 raise ValueError("PlanSessionAssignment does not belong to specified recommendation_plan_id")
 
+            # Verify exact garment-role correspondence unless was_modified_before_wear is explicitly asserted
+            pai_cur = self.conn.execute(
+                "SELECT outfit_role, garment_id FROM PlanAssignmentItem WHERE assignment_id = ?;",
+                (plan_assignment_id,),
+            )
+            expected_roles = {r["outfit_role"]: r["garment_id"] for r in pai_cur.fetchall()}
+            if not was_modified_before_wear and expected_roles != garment_roles:
+                raise ValueError(
+                    f"Logged garment roles {garment_roles} do not match recommended plan assignment {expected_roles}. "
+                    "Set was_modified_before_wear=1 with modification_reason if this wear intentionally modifies the recommendation."
+                )
+
         # Preflight: Verify each garment and resolve authorizations needed
         garments_by_id: Dict[str, sqlite3.Row] = {}
         auths_to_consume: Dict[str, str] = {}  # garment_id -> auth_id
@@ -183,9 +195,15 @@ class WearService:
                     if not auth_id:
                         auth_cur = self.conn.execute(
                             """
-                            SELECT id FROM GarmentWearAuthorization
-                            WHERE garment_id = ? AND status = 'AVAILABLE' AND consumed_by_wear_event_id IS NULL
-                            ORDER BY authorized_at ASC LIMIT 1;
+                            SELECT gwa.id FROM GarmentWearAuthorization gwa
+                            WHERE gwa.garment_id = ? AND gwa.status = 'AVAILABLE' AND gwa.consumed_by_wear_event_id IS NULL
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM PlanWearAuthorizationReservation pwar
+                                  JOIN RecommendationPlan rp ON pwar.plan_id = rp.id
+                                  WHERE pwar.authorization_id = gwa.id
+                                    AND rp.status IN ('PROPOSED', 'RESERVED')
+                              )
+                            ORDER BY gwa.authorized_at ASC LIMIT 1;
                             """,
                             (gid,),
                         )
@@ -592,4 +610,9 @@ class WearService:
                 WHERE id = ?;
                 """,
                 (InvalidationReason.RETIREMENT.value, pid),
+            )
+            # Release all authorization reservations held by this superseded plan
+            self.conn.execute(
+                "DELETE FROM PlanWearAuthorizationReservation WHERE plan_id = ?;",
+                (pid,),
             )
