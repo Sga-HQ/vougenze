@@ -1,16 +1,30 @@
-# Database files
-*.db
-*.sqlite
-*.sqlite3
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+*.pem
+*.key
+credentials.json
+secrets*.json
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-venv/
-env/
 .pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
 
 # OS / IDE
 .DS_Store
@@ -18,5 +32,10 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local media / catalogued storage
+# Local media / catalogued / private data
 catalogued/
+uploads/
+wardrobe_images/
+private_data/
+model_weights/
+checkpoints/
