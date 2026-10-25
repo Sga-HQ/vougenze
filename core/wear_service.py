@@ -86,6 +86,7 @@ class WearService:
         started_at_utc: Optional[str] = None,
         ended_at_utc: Optional[str] = None,
         reserved_authorizations: Optional[Dict[str, str]] = None,
+        operation_mode: str = "NEW_WEAR",
     ) -> str:
         """
         Logs a committed outfit wear after complete preflight validation:
@@ -109,6 +110,20 @@ class WearService:
             raise KeyError(f"WearSession {session_id} not found")
         if session["user_id"] != user_id:
             raise PermissionError("User does not own this wear session")
+        if operation_mode == "NEW_WEAR":
+            if session["status"] != "PLANNED":
+                raise ValueError(
+                    f"New wear requires PLANNED session; session '{session_id}' is {session['status']}"
+                )
+        elif operation_mode == "CORRECTIVE_REPLACEMENT":
+            if session["status"] != "COMPLETED":
+                raise ValueError(
+                    f"Corrective replacement requires COMPLETED session; session '{session_id}' is {session['status']}"
+                )
+        else:
+            raise ValueError(f"Unsupported wear operation_mode: {operation_mode}")
+        if was_modified_before_wear and not (modification_reason or "").strip():
+            raise ValueError("Modified wear requires a non-empty modification_reason")
 
         # Authoritative session metadata
         eff_session_type = session["session_type"]
@@ -366,6 +381,18 @@ class WearService:
         self._require_transaction()
         now = self._utc_now()
 
+        log_row = self.conn.execute(
+            "SELECT record_status FROM OutfitWearLog WHERE id = ?;",
+            (outfit_wear_log_id,),
+        ).fetchone()
+        if log_row is None:
+            raise KeyError(f"OutfitWearLog {outfit_wear_log_id} not found")
+        if log_row["record_status"] != RecordStatus.ACTIVE.value:
+            raise ValueError(
+                f"OutfitWearLog {outfit_wear_log_id} is not ACTIVE (status: {log_row['record_status']})"
+            )
+        if not (void_reason or "").strip():
+            raise ValueError("void_reason must be non-empty")
         cursor = self.conn.execute(
             "SELECT DISTINCT garment_id FROM OutfitWearLogItem WHERE outfit_wear_log_id = ?;",
             (outfit_wear_log_id,),
@@ -528,6 +555,7 @@ class WearService:
             feedback_notes=kwargs.get("feedback_notes", orig["feedback_notes"]),
             started_at_utc=orig["started_at_utc"],
             ended_at_utc=orig["ended_at_utc"],
+            operation_mode="CORRECTIVE_REPLACEMENT",
         )
 
         # Link superseded_by_id on original

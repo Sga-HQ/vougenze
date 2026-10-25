@@ -86,6 +86,16 @@ class PreferenceEvidenceService:
         Verifies content equality if a snapshot with the deterministic ID already exists.
         """
         now = self._utc_now()
+        incoming_garment_snapshots: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for role, gid in candidate.roles.items():
+            g_row = self.conn.execute("SELECT * FROM Garment WHERE id = ?;", (gid,)).fetchone()
+            if g_row is None:
+                raise KeyError(f"Garment '{gid}' not found for candidate snapshot")
+            if g_row["user_id"] != user_id:
+                raise PermissionError(
+                    f"Garment '{gid}' belongs to another user and cannot be snapshotted for '{user_id}'"
+                )
+            incoming_garment_snapshots[(role, gid)] = dict(g_row)
         cand_id = candidate.id if (candidate.id and candidate.id.strip()) else self._generate_snapshot_id(user_id, candidate, session_id)
 
         # Check existing snapshot
@@ -141,6 +151,18 @@ class PreferenceEvidenceService:
                 raise SnapshotConflictError(
                     f"Snapshot ID collision for candidate '{cand_id}' with mismatched roles: {existing_roles} vs {candidate.roles}"
                 )
+            item_rows = self.conn.execute(
+                "SELECT outfit_role, garment_id, garment_snapshot FROM OutfitCandidateSnapshotItem WHERE candidate_id = ?;",
+                (cand_id,),
+            ).fetchall()
+            existing_snapshots = {
+                (r["outfit_role"], r["garment_id"]): json.loads(r["garment_snapshot"] or "{}")
+                for r in item_rows
+            }
+            if existing_snapshots != incoming_garment_snapshots:
+                raise SnapshotConflictError(
+                    f"Snapshot ID collision for candidate '{cand_id}' with mismatched garment snapshots"
+                )
             return cand_id
 
         # Insert snapshot header
@@ -170,8 +192,7 @@ class PreferenceEvidenceService:
 
         # Insert snapshot items
         for role, gid in candidate.roles.items():
-            g_row = self.conn.execute("SELECT * FROM Garment WHERE id = ?;", (gid,)).fetchone()
-            g_snap = dict(g_row) if g_row else {"id": gid}
+            g_snap = incoming_garment_snapshots[(role, gid)]
             self.conn.execute(
                 """
                 INSERT INTO OutfitCandidateSnapshotItem(

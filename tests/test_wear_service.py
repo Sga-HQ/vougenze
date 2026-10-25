@@ -86,9 +86,10 @@ class TestWearService(unittest.TestCase):
             )
 
         # Attempting to log again for the same session raises IntegrityError due to partial unique index
-        # First ensure condition allows wear (WORN_REUSABLE)
+        # First ensure condition allows wear (WORN_REUSABLE) and session is PLANNED
         with self.db.transaction() as conn:
             conn.execute("UPDATE Garment SET condition_state = 'WORN_REUSABLE';")
+            conn.execute("UPDATE WearSession SET status = 'PLANNED';")
 
         with self.assertRaises(sqlite3.IntegrityError):
             with self.db.transaction() as conn:

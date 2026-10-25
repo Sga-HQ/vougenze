@@ -6,10 +6,11 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import uuid
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional, Union, List
+from typing import Any, Dict, Iterator, Optional, Union, List
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
@@ -35,11 +36,19 @@ def split_sql_statements(sql: str) -> List[str]:
 
 
 _ROLLBACK_CALLBACKS: Dict[int, List[Any]] = {}
+_ROLLBACK_CALLBACKS_LOCK = threading.RLock()
 
 
 def register_rollback_callback(conn: sqlite3.Connection, callback: Any) -> None:
-    """Registers a callback to execute if the active transaction on conn rolls back."""
-    _ROLLBACK_CALLBACKS.setdefault(id(conn), []).append(callback)
+    """Register cleanup for a transaction managed by ``Database.transaction``."""
+    if not conn.in_transaction:
+        raise RuntimeError("Rollback callback requires an active transaction")
+    with _ROLLBACK_CALLBACKS_LOCK:
+        if id(conn) not in _ROLLBACK_CALLBACKS:
+            raise RuntimeError(
+                "Rollback callback requires a transaction opened by Database.transaction"
+            )
+        _ROLLBACK_CALLBACKS[id(conn)].append(callback)
 
 
 class Database:
@@ -110,15 +119,18 @@ class Database:
         if conn.in_transaction:
             raise RuntimeError("Nested transaction attempted without savepoint support")
         conn_id = id(conn)
-        _ROLLBACK_CALLBACKS[conn_id] = []
+        with _ROLLBACK_CALLBACKS_LOCK:
+            _ROLLBACK_CALLBACKS[conn_id] = []
         conn.execute("BEGIN IMMEDIATE;")
         try:
             yield conn
             conn.execute("COMMIT;")
-            _ROLLBACK_CALLBACKS.pop(conn_id, None)
+            with _ROLLBACK_CALLBACKS_LOCK:
+                _ROLLBACK_CALLBACKS.pop(conn_id, None)
         except Exception:
             conn.execute("ROLLBACK;")
-            callbacks = _ROLLBACK_CALLBACKS.pop(conn_id, [])
+            with _ROLLBACK_CALLBACKS_LOCK:
+                callbacks = _ROLLBACK_CALLBACKS.pop(conn_id, [])
             for cb in callbacks:
                 try:
                     cb()
@@ -126,7 +138,8 @@ class Database:
                     pass
             raise
         finally:
-            _ROLLBACK_CALLBACKS.pop(conn_id, None)
+            with _ROLLBACK_CALLBACKS_LOCK:
+                _ROLLBACK_CALLBACKS.pop(conn_id, None)
             if not self._is_memory:
                 conn.close()
 

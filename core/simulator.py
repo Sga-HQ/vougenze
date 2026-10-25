@@ -302,7 +302,8 @@ class LifecycleSmokeSimulator:
                                 occasion_context=session["session_type"],
                                 selected_candidate=cand,
                                 alternatives=[],
-                                selection_reason=["planned_continuation_optimal"],
+                                selection_reason=["synthetic_simulation_followed_plan"],
+                                constraint_flags={"synthetic": 1, "training_eligible": 0},
                             )
                             evidence_count += 1
 

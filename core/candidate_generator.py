@@ -151,12 +151,19 @@ class CandidateGenerator:
             ):
                 authorization = self.conn.execute(
                     """
-                    SELECT id
-                    FROM GarmentWearAuthorization
-                    WHERE garment_id = ?
-                      AND status = 'AVAILABLE'
-                      AND consumed_by_wear_event_id IS NULL
-                    ORDER BY authorized_at
+                    SELECT gwa.id
+                    FROM GarmentWearAuthorization AS gwa
+                    WHERE gwa.garment_id = ?
+                      AND gwa.status = 'AVAILABLE'
+                      AND gwa.consumed_by_wear_event_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM PlanWearAuthorizationReservation AS pwar
+                          JOIN RecommendationPlan AS rp ON rp.id = pwar.plan_id
+                          WHERE pwar.authorization_id = gwa.id
+                            AND rp.status IN ('PROPOSED', 'RESERVED')
+                      )
+                    ORDER BY gwa.authorized_at
                     LIMIT 1;
                     """,
                     (g["id"],),
@@ -319,25 +326,50 @@ class CandidateGenerator:
         candidates: List[OutfitCandidate],
         selected: OutfitCandidate,
     ) -> Dict[str, int]:
+        """Return complete-outfit replacement-core counts for each selected role.
+
+        The count includes the selected core itself so ``<= 1`` means that no
+        complete alternative core exists. A one-piece occupying top and bottom
+        is compared against both one-piece and two-piece alternatives by using
+        canonical physical replacement cores rather than role-local garment IDs.
         """
-        Scenario 28: Computes complete valid outfit replacements for each component
-        of the selected candidate among the candidates for this session.
-        """
-        substitutes = {}
+        selected_physical = set(selected.garment_ids)
+        substitutes: Dict[str, int] = {}
+
         for role, selected_gid in selected.roles.items():
-            if role in ("top", "bottom") and selected.roles.get("top") == selected.roles.get("bottom"):
-                replacements = {
-                    c.roles["top"]
-                    for c in candidates
-                    if c.roles.get("top") == c.roles.get("bottom") and c.roles.get("top") != selected_gid
-                }
-            else:
-                replacements = {
-                    c.roles[role]
-                    for c in candidates
-                    if role in c.roles and c.roles[role] != selected_gid
-                }
-            substitutes[role] = len(replacements) + 1
+            target_roles = {
+                r for r, gid in selected.roles.items() if gid == selected_gid
+            }
+            cores: Set[Tuple[Tuple[str, Tuple[str, ...]], ...]] = set()
+
+            for candidate in candidates:
+                if candidate.id == selected.id:
+                    continue
+                if selected_gid in candidate.garment_ids:
+                    continue
+
+                # New physical garments that restore at least one target role.
+                coverage_by_gid: Dict[str, Set[str]] = {}
+                for target_role in target_roles:
+                    replacement_gid = candidate.roles.get(target_role)
+                    if replacement_gid and replacement_gid != selected_gid:
+                        coverage_by_gid.setdefault(replacement_gid, set()).add(target_role)
+
+                restored_roles = set().union(*coverage_by_gid.values()) if coverage_by_gid else set()
+                if restored_roles != target_roles:
+                    continue
+
+                canonical_core = tuple(sorted(
+                    (gid, tuple(sorted(roles)))
+                    for gid, roles in coverage_by_gid.items()
+                ))
+                cores.add(canonical_core)
+
+            # Include the selected structure as the baseline option.
+            count = len(cores) + 1
+            for target_role in target_roles:
+                substitutes[target_role] = count
+
         return substitutes
 
     def _generate_candidate_id(self, session_id: str, role_map: Dict[str, str]) -> str:

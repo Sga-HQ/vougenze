@@ -171,13 +171,17 @@ class LaundryService:
 
         if policy_id:
             pol_cur = self.conn.execute(
-                "SELECT user_id FROM LaundryPolicy WHERE id = ?;", (policy_id,)
+                "SELECT user_id, effective_from, effective_until FROM LaundryPolicy WHERE id = ?;", (policy_id,)
             )
             pol = pol_cur.fetchone()
             if not pol:
                 raise KeyError(f"LaundryPolicy {policy_id} not found")
             if pol["user_id"] != user_id:
                 raise PermissionError("LaundryPolicy belongs to a different user")
+            if sent_date < pol["effective_from"] or (
+                pol["effective_until"] is not None and sent_date > pol["effective_until"]
+            ):
+                raise ValueError("LaundryPolicy is not active on sent_date")
 
         placeholders = ",".join("?" for _ in unique_ids)
         cur = self.conn.execute(
@@ -422,7 +426,7 @@ class LaundryService:
     ) -> None:
         """Scenario 4: Marks a batch as delayed. Rejects closed or terminal batches."""
         self._require_transaction()
-        cur = self.conn.execute("SELECT status FROM LaundryBatch WHERE id = ?;", (batch_id,))
+        cur = self.conn.execute("SELECT status, sent_date, expected_return_date FROM LaundryBatch WHERE id = ?;", (batch_id,))
         row = cur.fetchone()
         if not row:
             raise KeyError(f"LaundryBatch {batch_id} not found")
@@ -431,6 +435,11 @@ class LaundryService:
         if row["status"] not in ("IN_LAUNDRY", "PARTIAL_RETURN"):
             raise ValueError(f"Cannot mark batch {batch_id} delayed from status '{row['status']}'")
 
+        if new_expected_return_date:
+            if new_expected_return_date < row["sent_date"]:
+                raise ValueError("new_expected_return_date cannot be earlier than sent_date")
+            if new_expected_return_date < row["expected_return_date"]:
+                raise ValueError("A delay cannot move expected_return_date earlier")
         effective_reason = delay_reason or reason
         note_suffix = f"Delayed: {effective_reason}" if effective_reason else "Delayed"
         if new_expected_return_date:

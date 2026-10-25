@@ -41,7 +41,7 @@ class PartialPlan:
     fallback_count: int = 0
     total_quality: float = 0.0
     total_repetition: float = 0.0
-    min_high_quality: float = 1.0
+    min_high_quality: Optional[float] = None
 
 
 class ContinuationPlanner:
@@ -70,6 +70,7 @@ class ContinuationPlanner:
         """
         target = attainable_target if attainable_target is not None else target_diversity
         diversity_deficit = max(0, target - p.diversity_progress)
+        high_floor = p.min_high_quality if p.min_high_quality is not None else 1.0
         return (
             p.uncovered_high,
             p.uncovered_normal,
@@ -77,7 +78,7 @@ class ContinuationPlanner:
             p.uncertain_dependencies,
             p.fallback_count,
             diversity_deficit,
-            -p.min_high_quality,
+            -high_floor,
             -p.total_quality,
             p.total_repetition,
         )
@@ -243,12 +244,10 @@ class ContinuationPlanner:
                         simulated_wear_history=sim_history,
                     )
 
+                    # Keep deterministic quality semantically stable. Exploration is
+                    # represented only through the diversity coordinate, never by
+                    # mutating or inflating persisted quality.
                     effective_q = q
-                    if strategy_mode == StrategyMode.EXPLORATORY and importance in ("LOW", "NORMAL"):
-                        novelty_bonus = sum(
-                            0.05 for gid in evaluated_cand.garment_ids if partial.simulated_wears.get(gid, 0) == 0
-                        )
-                        effective_q += novelty_bonus
 
                     p_next = copy.deepcopy(partial)
                     p_next.assignments[sid] = evaluated_cand
@@ -267,7 +266,11 @@ class ContinuationPlanner:
                                 p_next.diversity_progress += 1
 
                     if importance == "HIGH":
-                        p_next.min_high_quality = min(p_next.min_high_quality, effective_q)
+                        p_next.min_high_quality = (
+                            effective_q
+                            if p_next.min_high_quality is None
+                            else min(p_next.min_high_quality, effective_q)
+                        )
 
                     # Advance simulated wear state
                     for gid in evaluated_cand.garment_ids:
@@ -343,7 +346,7 @@ class ContinuationPlanner:
                 best_partial.uncovered_low,
                 best_partial.uncertain_dependencies,
                 best_partial.fallback_count,
-                round(best_partial.min_high_quality, 4) if sessions else 1.0,
+                round(best_partial.min_high_quality, 4) if best_partial.min_high_quality is not None else None,
                 round(best_partial.total_quality, 4),
                 round(best_partial.total_repetition, 4),
             ),
