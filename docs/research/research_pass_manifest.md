@@ -80,7 +80,7 @@ The state machine proved that under the configured random step sequences:
 
 ---
 
-## 5. Post-Change Test Discovery Results
+## 5. Post-Rebase Test Discovery Results (Rebased on main a38827d)
 
 Command executed:
 ```bash
@@ -88,15 +88,16 @@ python -m unittest discover tests
 ```
 
 **Outcome:**
-- **Total Tests Discovered:** 109
-- **Passing Tests:** 107
-- **Expected Failures (`x`):** 2
-  - `test_vzw2_modification_reason_counterexample`: Reproduces missing reason enforcement (`was_modified_before_wear=1` with `modification_reason=None`).
-  - `test_laundry_delay_plan_consequence_counterexample`: Reproduces missing plan invalidation (`RecommendationPlan` remains `PROPOSED` despite laundry delay).
+- **Total Tests Discovered:** 112
+- **Passing Tests:** 111
+- **Expected Failures (`x`):** 1
+  - `test_laundry_delay_plan_consequence_counterexample`: Reproduces missing plan invalidation (`RecommendationPlan` remains `PROPOSED` despite laundry delay). Left explicitly unresolved.
+- **Converted Regression (Passing):** 1
+  - `test_vzw2_modification_reason_counterexample`: Formerly expected failure; converted to passing deterministic regression following the VZ-W2 repair in `wear_service.py`.
 - **Unexpected Failures (`F`):** 0
 - **Unexpected Successes (`u`):** 0
-- **Total Execution Time:** ~2.75 seconds
-- **Discovery Status:** `OK (expected failures=2)`
+- **Total Execution Time:** ~8.2 seconds
+- **Discovery Status:** `OK (expected failures=1)`
 
 ---
 

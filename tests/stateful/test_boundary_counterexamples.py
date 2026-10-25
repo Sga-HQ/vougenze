@@ -63,14 +63,13 @@ class TestBoundaryCounterexamples(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    @unittest.expectedFailure
     @given(blank_reason=st.sampled_from([None, "", "   ", "\t\n"]))
     @settings(max_examples=10, deadline=None, suppress_health_check=[HealthCheck.too_slow])
     def test_vzw2_modification_reason_counterexample(self, blank_reason):
         """
-        Attacks VZ-W2:
+        Regression for VZ-W2:
         Governed Expectation: was_modified_before_wear = True MUST require a non-empty, non-whitespace modification_reason.
-        Current Code Behavior: permits was_modified_before_wear = True with None or whitespace, inserting NULL.
+        Current Code Behavior: raises ValueError when was_modified_before_wear = True with blank or whitespace reason.
         """
         import uuid
         top_id = f"g_top_{uuid.uuid4().hex[:8]}"
@@ -96,9 +95,9 @@ class TestBoundaryCounterexamples(unittest.TestCase):
             )
 
         roles = {"top": top_id, "bottom": bot_id}
-        try:
+        with self.assertRaises(ValueError):
             with self.db.transaction() as conn:
-                log_id = self.wear_service.log_outfit_wear(
+                self.wear_service.log_outfit_wear(
                     user_id=self.user_id,
                     session_id=sess_id,
                     garment_roles=roles,
@@ -106,16 +105,6 @@ class TestBoundaryCounterexamples(unittest.TestCase):
                     was_modified_before_wear=True,
                     modification_reason=blank_reason,
                 )
-            # If log_id is returned without raising ValueError, the defect is reproduced!
-            cur = self.conn.execute("SELECT was_modified_before_wear, modification_reason FROM OutfitWearLog WHERE id = ?;", (log_id,))
-            row = cur.fetchone()
-            self.fail(
-                f"COUNTEREXAMPLE DETECTED (VZ-W2): log_outfit_wear permitted was_modified_before_wear=1 with blank reason {repr(blank_reason)}. "
-                f"Persisted row: was_modified={row['was_modified_before_wear']}, modification_reason={repr(row['modification_reason'])}"
-            )
-        except ValueError as e:
-            # If ValueError was raised, the guard would be present (not current behavior)
-            pass
 
     @unittest.expectedFailure
     def test_laundry_delay_plan_consequence_counterexample(self):
